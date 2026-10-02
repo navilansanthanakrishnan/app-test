@@ -1,0 +1,210 @@
+#!/bin/bash
+# netcut - cut one application's network, then let it reconnect at once.
+#
+#   netcut toggle [app]      down if it is up, up if it is down (what ⌘9 does)
+#   netcut hold Discord      cut it and leave it cut until the next toggle
+#   netcut front             blip: cut whatever is in front, straight back
+#   netcut app Discord       blip a named application (or a full .app path)
+#   netcut pin Discord       attach ⌘9 to that app; it stops following focus
+#   netcut pin off           back to "whatever is in front"
+#   netcut pin               print what ⌘9 is attached to
+#   netcut discord           cut via the curated profile of that name
+#   netcut app Slack 3       hold the cut for a full 3 seconds instead
+#   netcut app Slack 3 drop  silent packet drop (looks like real signal loss)
+#   netcut probe Spotify     dry run: what a cut would block, touching nothing
+#   netcut running           applications that can be targeted right now
+#   netcut status            is a cut active right now
+#   netcut restore           clear any block immediately
+#   netcut apps              list installed profiles
+#   netcut log [n]           recent activity
+#
+# Unprivileged: hands the request to netcutd over its FIFO and streams back
+# the measured timings. --markers keeps the machine-readable progress lines.
+set -uo pipefail
+
+TARGET=$0
+while [ -L "$TARGET" ]; do TARGET=$(readlink "$TARGET"); done
+SELF_DIR=$(cd "$(dirname "$TARGET")" && pwd)
+. "$SELF_DIR/lib/common.sh"
+
+MARKERS=0
+[ "${1:-}" = --markers ] && { MARKERS=1; shift; }
+
+die() { printf 'netcut: %s\n' "$*" >&2; exit 1; }
+profiles() { ls "$NETCUT_PROFILE_DIR" 2>/dev/null | sed 's/\.conf$//' | tr '\n' ' '; }
+
+no_daemon() {
+  cat >&2 <<MSG
+netcut: the privileged helper is not installed or not running.
+
+  install it once (asks for your password):
+      sudo $SELF_DIR/install.sh
+
+  or run a single cut without installing anything:
+      sudo $SELF_DIR/netcutd oneapp Discord
+MSG
+  exit 1
+}
+
+stale_daemon() {
+  cat >&2 <<MSG
+netcut: the installed helper is older than this command and cannot cut an
+arbitrary application (it speaks protocol ${1:-1}, this needs $NETCUT_PROTOCOL).
+
+  redeploy it (asks for your password):
+      sudo $SELF_DIR/install.sh
+MSG
+  exit 1
+}
+
+# frontmost -> bundle path of the frontmost application
+# lsappinfo is a plain system query: no Apple Events, no automation permission.
+frontmost() {
+  local asn path
+  asn=$(lsappinfo front 2>/dev/null) || return 1
+  [ -n "$asn" ] || return 1
+  path=$(lsappinfo info -only bundlepath "$asn" 2>/dev/null \
+         | sed -n 's/.*"LSBundlePath"="\(.*\)".*/\1/p')
+  [ -n "$path" ] || return 1
+  printf '%s\n' "$path"
+}
+
+running_apps() {
+  local asn path
+  for asn in $(lsappinfo visibleProcessList 2>/dev/null); do
+    path=$(lsappinfo info -only bundlepath "$asn" 2>/dev/null \
+           | sed -n 's/.*"LSBundlePath"="\(.*\)".*/\1/p')
+    [ -n "$path" ] && printf '%s\n' "$path"
+  done | sort -u
+}
+
+# The hotkey agent reads this file every time ⌘9 is pressed, so a pin from the
+# shell takes effect on the next press with no restart. "frontmost" or absent
+# means follow focus.
+NETCUT_PIN=${NETCUT_PIN:-$HOME/.config/netcut/target}
+
+pin_show() {
+  local cur
+  cur=$(cat "$NETCUT_PIN" 2>/dev/null | head -1)
+  case "${cur:-frontmost}" in
+    frontmost) printf '⌘9 cuts whatever app is in front\n' ;;
+    *) printf '⌘9 is attached to: %s\n' "$cur" ;;
+  esac
+}
+
+pin_set() {
+  local spec=$1
+  case "$spec" in
+    *[![:print:]]*) die "that is not a usable application name" ;;
+  esac
+  mkdir -p "$(dirname "$NETCUT_PIN")" || die "could not write $NETCUT_PIN"
+  printf '%s\n' "$spec" > "$NETCUT_PIN" || die "could not write $NETCUT_PIN"
+  pin_show
+}
+
+# request <verb> <arg> <hold> <mode>
+request() {
+  [ -p "$NETCUT_FIFO" ] && [ -w "$NETCUT_FIFO" ] || no_daemon
+  local proto id reply deadline shown=0 total filter spins=0
+  proto=$(cat "$NETCUT_RUN_DIR/protocol" 2>/dev/null | tr -dc '0-9')
+  [ "${proto:-1}" -ge "$NETCUT_PROTOCOL" ] || stale_daemon "${proto:-1}"
+
+  id=$$-$(date +%s)
+  reply="$NETCUT_RUN_DIR/reply.$id"
+  rm -f "$reply" 2>/dev/null
+  # Pipe-delimited, every field present: an empty field used to collapse and
+  # carry the id away with it, so the reply was written where nobody waited.
+  printf '%s|%s|%s|%s|%s\n' "$1" "${2:--}" "${3:--}" "${4:--}" "$id" > "$NETCUT_FIFO" \
+    || die "could not reach netcutd"
+
+  filter='^__done__$'
+  [ "$MARKERS" = 0 ] && filter='^__done__$|^__restored__$|^__latched__$'
+  deadline=$(( $(date +%s) + NETCUT_MAX_SECONDS + 60 ))
+  # Every read works off one line count, and the end-of-reply marker is only
+  # looked for inside the lines already printed. Counting and then asking
+  # separately whether it had finished lost the whole reply whenever netcutd
+  # wrote it between the two reads, which is every fast reply.
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ -f "$reply" ]; then
+      total=$(wc -l < "$reply" 2>/dev/null | tr -d ' ')
+      if [ "${total:-0}" -gt "$shown" ]; then
+        sed -n "$((shown + 1)),${total}p" "$reply" | grep -Ev "$filter"
+        shown=$total
+      fi
+      if [ "${total:-0}" -gt 0 ] \
+         && sed -n "1,${total}p" "$reply" | grep -q '^__done__$'; then
+        # Removing it is netcutd's job; the run directory is root-owned.
+        if sed -n "1,${total}p" "$reply" | grep -q '^error:'; then
+          rm -f "$reply" 2>/dev/null; return 1
+        fi
+        rm -f "$reply" 2>/dev/null; return 0
+      fi
+    fi
+    # Tight for the first half second — a toggle answers in milliseconds and
+    # a 100ms poll would be most of its latency — then back off.
+    if [ "$spins" -lt 50 ]; then spins=$((spins + 1)); sleep 0.01; else sleep 0.1; fi
+  done
+  rm -f "$reply" 2>/dev/null
+  die "timed out waiting for netcutd (see: netcut log)"
+}
+
+case "${1:-}" in
+  ''|-h|--help|help)
+    sed -n '2,22p' "$0" | sed 's/^#\{1,\} \{0,1\}//'
+    printf 'profiles: %s\n' "$(profiles)"
+    ;;
+  status)  request status ;;
+  restore) request restore ;;
+  apps)    p=$(profiles); [ -n "$p" ] && printf '%s\n' $p || die "no profiles installed" ;;
+  running) running_apps | sed 's#.*/##; s/\.app$//' ;;
+  pin)
+    case "${2:-}" in
+      '')               pin_show ;;
+      off|frontmost|front) pin_set frontmost ;;
+      *)                pin_set "$2" ;;
+    esac
+    ;;
+  log)     tail -n "${2:-25}" "$NETCUT_LOG" 2>/dev/null || die "no log yet" ;;
+  probe)   [ -n "${2:-}" ] || die "probe needs an application"; request probe "$2" ;;
+  toggle)
+    spec=${2:-}
+    if [ -z "$spec" ]; then
+      spec=$(cat "$NETCUT_PIN" 2>/dev/null | head -1)
+      case "${spec:-frontmost}" in
+        frontmost|'') spec=$(frontmost) || die "could not tell which application is in front" ;;
+      esac
+    fi
+    request toggle "$spec" - "${3:-drop}"
+    ;;
+  hold)
+    [ -n "${2:-}" ] || die "hold needs an application"
+    request latch "$2" - "${3:-drop}"
+    ;;
+  front)
+    case "${3:-return}" in
+      return|drop) ;;
+      *) die "mode must be 'return' (instant reset) or 'drop' (silent)" ;;
+    esac
+    app=$(frontmost) || die "could not tell which application is in front"
+    printf 'front: %s\n' "$(printf '%s' "${app##*/}" | sed 's/\.app$//')"
+    request app "$app" "${2:-$NETCUT_DEFAULT_HOLD}" "${3:-return}"
+    ;;
+  app)
+    [ -n "${2:-}" ] || die "app needs a name or a .app path"
+    case "${4:-return}" in
+      return|drop) ;;
+      *) die "mode must be 'return' (instant reset) or 'drop' (silent)" ;;
+    esac
+    request app "$2" "${3:-$NETCUT_DEFAULT_HOLD}" "${4:-return}"
+    ;;
+  *)
+    profile=$1; hold=${2:-$NETCUT_DEFAULT_HOLD}; mode=${3:-return}
+    [ -f "$NETCUT_PROFILE_DIR/$profile.conf" ] \
+      || die "no profile '$profile' (have: $(profiles)); for any other app: netcut app $profile"
+    case "$mode" in
+      return|drop) ;;
+      *) die "mode must be 'return' (instant reset) or 'drop' (silent)" ;;
+    esac
+    request cut "$profile" "$hold" "$mode"
+    ;;
+esac

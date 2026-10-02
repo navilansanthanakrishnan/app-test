@@ -1,0 +1,497 @@
+#!/bin/bash
+# netcutd - privileged worker for netcut. Cuts one application's network by
+# dropping its live peers (plus a profile's reconnect endpoints, when the target
+# is a profile) in a pf sub-anchor, then restores and measures the recovery.
+#
+# Two kinds of target:
+#   profile <name>   a curated .conf with reconnect endpoints enumerated
+#   app <bundle>     any running application, discovered from its live sockets
+#
+# Default hold is "asap": the block lasts only until the app's own sockets die,
+# which is the shortest outage that still registers as a disconnect.
+#
+# Runs as root under launchd (com.netcut.helper) and takes work
+# only from a FIFO owned by the trigger user. Never sources a user-writable
+# file; a target arrives as data and is only ever passed as an argument.
+# bash 3.2 compatible.
+set -uo pipefail
+
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=lib/common.sh
+. "$SELF_DIR/lib/common.sh"
+
+STATE="$NETCUT_RUN_DIR/state"
+TRIGGER_USER=${NETCUT_TRIGGER_USER:-$(stat -f %Su /dev/console)}
+ASAP_CAP=${NETCUT_ASAP_CAP:-5}
+
+say() { log "$*" >> "$NETCUT_LOG"; }
+# Monotonic-enough clock in integer nanoseconds. date(1) on this system
+# supports %N; perl is the fallback so the helper still works if it stops.
+if [ "$(date +%N 2>/dev/null)" -eq "$(date +%N 2>/dev/null)" ] 2>/dev/null \
+   || printf '%s' "$(date +%N 2>/dev/null)" | grep -qE '^[0-9]+$'; then
+  now() { date +%s%N; }
+else
+  now() { perl -MTime::HiRes -e 'printf "%.0f", Time::HiRes::time() * 1e9'; }
+fi
+since() { printf '%s\n' $(( ( $(now) - $1 ) / 1000000 )); }   # -> milliseconds
+
+# ---------- pf plumbing ----------
+
+restore() {   # idempotent; safe when nothing is cut
+  local reason=${1:-manual} token=''
+  [ -f "$STATE" ] && token=$(sed -n 's/^token=//p' "$STATE")
+  pfctl -a "$NETCUT_ANCHOR" -F all >/dev/null 2>&1
+  [ -n "$token" ] && pfctl -X "$token" >/dev/null 2>&1
+  rm -f "$STATE"
+  say "restore ($reason)"
+}
+
+# ---------- discovery ----------
+
+# app_pids <pgrep -f pattern> -> comma-separated pids
+# netcut's own processes are filtered out: an app target is a bundle path, and
+# that same path sits in the argv of the client that asked for the cut, so an
+# unfiltered pgrep would "find" the app even when it is not running.
+app_pids() {
+  local pids
+  pids=$(pgrep -f "$1" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+  [ -n "$pids" ] || return 0
+  ps -ww -o pid=,command= -p "$pids" 2>/dev/null \
+    | grep -v netcut | awk '{print $1}' | tr '\n' ',' | sed 's/,$//'
+}
+
+# live_sockets <proc_match> -> one "local:port->remote:port" tuple per line
+live_sockets() {
+  sockets_of_pids "$(app_pids "$1")"
+}
+
+# sockets_of_pids <comma-separated pids> -- the same, without paying for the
+# pid lookup again. lsof over a browser's ~90 processes is the slowest step in
+# a cut, so a cut does this once and reuses the answer.
+sockets_of_pids() {
+  local pids=$1
+  [ -n "$pids" ] || return 0
+  lsof -nP -i -a -p "$pids" 2>/dev/null \
+    | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /->/) print $i }' | sort -u
+}
+
+# remote address of each tuple, ports and brackets stripped
+peers_of() { sed 's/.*->//; s/:[0-9]*$//; s/^\[//; s/\]$//' | grep -v '^\*$' | sort -u; }
+
+resolve_domains() {
+  local d
+  for d in $1; do
+    dig +short +time=1 +tries=1 "$d" A    2>/dev/null | grep -E '^[0-9]+\.'
+    dig +short +time=1 +tries=1 "$d" AAAA 2>/dev/null | grep ':'
+  done
+}
+
+# ---------- app targets ----------
+
+# pg_quote <string> -> the same string, safe as a pgrep/grep ERE literal
+pg_quote() { printf '%s\n' "$1" | sed 's/[][\\.^$*+?(){}|]/\\&/g'; }
+
+# proc_match_for <resolved target> -> the pattern that finds its processes
+# A .app is matched by its full bundle path, which catches every helper inside
+# it. A .exe is matched by filename: the process belongs to Wine, and its argv
+# carries a Windows-style path that never matches the unix one.
+proc_match_for() {
+  case "$1" in
+    *.exe|*.EXE) pg_quote "${1##*/}" ;;
+    *) pg_quote "$1" ;;
+  esac
+}
+
+# resolve_app_spec <spec> -> absolute bundle (or executable) path on stdout
+# Accepts an absolute path to an existing .app bundle, executable or .exe, a
+# bare .exe name, or a bare application name looked up in the standard
+# application directories. Anything else is refused, so a target can never be
+# an arbitrary string.
+resolve_app_spec() {
+  local spec=${1%/} base
+  case "$spec" in
+    *[![:print:]]*) return 1 ;;
+    *'`'*|*'$'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'"'*|*"'"*) return 1 ;;
+  esac
+  [ -n "$spec" ] || return 1
+  if [ "${spec#/}" != "$spec" ]; then
+    case "$spec" in
+      *.app) [ -d "$spec" ] && { printf '%s\n' "$spec"; return 0; } ;;
+      # A Windows binary under Wine is usually not chmod +x, so the execute
+      # bit is not what makes it a target -- existing on disk is.
+      *.exe|*.EXE) [ -f "$spec" ] && { printf '%s\n' "$spec"; return 0; } ;;
+    esac
+    [ -f "$spec" ] && [ -x "$spec" ] && { printf '%s\n' "$spec"; return 0; }
+    return 1
+  fi
+  # A bare "Game.exe": Wine is what owns the process, so there is no bundle to
+  # find on disk. It stands as the process name and must match something live.
+  case "$spec" in *.exe|*.EXE) printf '%s\n' "$spec"; return 0 ;; esac
+  for base in /Applications "/Users/$TRIGGER_USER/Applications" \
+              /Applications/Utilities /System/Applications \
+              /System/Applications/Utilities /System/Library/CoreServices; do
+    [ -d "$base/$spec.app" ] && { printf '%s\n' "$base/$spec.app"; return 0; }
+  done
+  return 1
+}
+
+# kill_states <v4 list> <v6 list>
+# Open connections match existing pf states and bypass the ruleset, so the
+# states have to be killed for the block to bite. Two forms are needed: `-k
+# host` kills states *originating from* that host, which only covers inbound,
+# so an outbound connection needs `-k <any> -k host`. The wildcard must be of
+# the same family as the address — `0.0.0.0/0` against an IPv6 address is
+# rejected, which is why v6 connections used to survive a cut.
+#
+# Fanned out, bounded at 24 at a time: a browser holds ~90 addresses, and
+# doing these one after another is the slowest part of a cut by far.
+kill_states() {
+  # xargs rather than `cmd &` + wait: a bare `wait` in bash waits for every
+  # child of the shell, and this daemon keeps a 30-minute watchdog child
+  # alive during a latch. That wait blocked the whole daemon -- and so every
+  # later ⌘9 press -- until the watchdog's sleep ran out. One xargs child,
+  # waited on by the pipeline itself, cannot do that.
+  if [ -n "$1" ]; then
+    printf '%s\n' $1 | sed 's#/.*##' | xargs -P 12 -I{} \
+      sh -c 'pfctl -k "$1" >/dev/null 2>&1; pfctl -k 0.0.0.0/0 -k "$1" >/dev/null 2>&1' _ {}
+  fi
+  if [ -n "$2" ]; then
+    printf '%s\n' $2 | sed 's#/.*##' | xargs -P 12 -I{} \
+      sh -c 'pfctl -k "$1" >/dev/null 2>&1; pfctl -k ::/0 -k "$1" >/dev/null 2>&1' _ {}
+  fi
+  return 0
+}
+
+# ---------- the cut ----------
+
+# apply_block <label> <proc_match> <domains> <cidrs> <mode> <hold tag>
+# Everything up to and including "the app is now cut off": discovery, the
+# guard, the pf rules and the state kill. Shared by the timed cut and the
+# latch so there is exactly one copy of the part that touches the firewall.
+# On success the block is up and these are set for the caller:
+apply_block() {
+  local label=$1 proc_match=$2 hold_domains=$3 hold_cidrs=$4 mode=$5 tag=$6
+  BLOCK_V4=''; BLOCK_V6=''; BLOCK_BEFORE=''; BLOCK_N_BEFORE=0
+  BLOCK_ID=''; BLOCK_T0=''; BLOCK_SKIPPED=0
+
+  [ -f "$STATE" ] && { say "refused: cut already active"
+    printf 'error: a cut is already active (run: netcut restore)\n'; return 1; }
+
+  local pids
+  pids=$(app_pids "$proc_match")
+  [ -n "$pids" ] || { say "refused: $label not running"
+    printf 'error: %s is not running\n' "$label"; return 1; }
+
+  # The exact sockets to kill. Their disappearance is the disconnect signal.
+  local before n_before
+  before=$(sockets_of_pids "$pids")
+  n_before=$(printf '%s' "$before" | grep -c . | tr -d ' ')
+
+  local candidates addr fam v4='' v6='' skipped=0
+  candidates=$( { printf '%s\n' "$before" | peers_of
+                  resolve_domains "$hold_domains"
+                  printf '%s\n' $hold_cidrs; } | sort -u )
+  for addr in $candidates; do
+    fam=$(ip_family "$addr"); [ "$fam" = bad ] && continue
+    guard_ok "$addr" "$fam" || { skipped=$((skipped + 1)); continue; }
+    if [ "$fam" = v4 ]; then v4="$v4 $addr"; else v6="$v6 $addr"; fi
+  done
+  [ -n "$v4$v6" ] || { say "refused: nothing blockable for $label (sockets=$n_before skipped=$skipped)"
+    printf 'error: %s holds no blockable connection right now\n' "$label"
+    printf '       (%s live socket(s), %s address(es) refused by the guard)\n' "$n_before" "$skipped"
+    return 1; }
+
+  local rules='' b="block $mode quick"
+  [ -n "$v4" ] && rules="$rules
+table <netcut4> persist {$v4 }
+$b inet from any to <netcut4>
+$b inet from <netcut4> to any"
+  [ -n "$v6" ] && rules="$rules
+table <netcut6> persist {$v6 }
+$b inet6 from any to <netcut6>
+$b inet6 from <netcut6> to any"
+
+  local t_cut
+  t_cut=$(now)
+  if ! printf '%s\n' "$rules" | pfctl -a "$NETCUT_ANCHOR" -f - 2>/tmp/netcut.pferr; then
+    say "FAILED anchor load: $(tr '\n' ' ' < /tmp/netcut.pferr)"
+    pfctl -a "$NETCUT_ANCHOR" -F all >/dev/null 2>&1
+    printf 'error: pf rule load failed (see /var/log/netcut.log)\n'; return 1
+  fi
+  local token id
+  token=$(pfctl -E 2>&1 | sed -n 's/.*Token *: *//p' | tr -d ' ')
+  id=$$-$(date +%s)
+  printf 'id=%s\ntoken=%s\ntarget=%s\nhold=%s\nmode=%s\n' \
+    "$id" "$token" "$label" "$tag" "$mode" > "$STATE"
+
+  kill_states "$v4" "$v6"
+
+  BLOCK_V4=$v4; BLOCK_V6=$v6; BLOCK_BEFORE=$before; BLOCK_N_BEFORE=$n_before
+  BLOCK_ID=$id; BLOCK_T0=$t_cut; BLOCK_SKIPPED=$skipped
+}
+
+# cut_core <label> <proc_match> <hold_domains> <hold_cidrs> <hold> <mode>
+cut_core() {
+  local label=$1 proc_match=$2 hold_domains=$3 hold_cidrs=$4 hold=$5 mode=${6:-return}
+
+  case "$mode" in return|drop) ;; *) printf 'error: bad mode\n'; return 1 ;; esac
+
+  local cap
+  if [ "$hold" = asap ]; then
+    cap=$ASAP_CAP
+  else
+    printf '%s' "$hold" | grep -qE '^[0-9]+(\.[0-9]+)?$' || { say "refused: bad duration '$hold'"
+      printf 'error: hold must be a number of seconds or "asap"\n'; return 1; }
+    awk -v s="$hold" -v m="$NETCUT_MAX_SECONDS" 'BEGIN{exit !(s>0 && s<=m)}' || {
+      say "refused: duration $hold outside 0<s<=$NETCUT_MAX_SECONDS"
+      printf 'error: hold must be >0 and <=%ss\n' "$NETCUT_MAX_SECONDS"; return 1; }
+    cap=$hold
+  fi
+  apply_block "$label" "$proc_match" "$hold_domains" "$hold_cidrs" "$mode" "$hold" \
+    || return 1
+  # Quoted: the socket list is multi-line and word-splitting would shred it.
+  local before="$BLOCK_BEFORE" n_before="$BLOCK_N_BEFORE" skipped="$BLOCK_SKIPPED"
+  local v4="$BLOCK_V4" v6="$BLOCK_V6" t_cut="$BLOCK_T0" id="$BLOCK_ID"
+
+  # Restores even if this shell is killed mid-cut.
+  ( sleep "$(awk -v c="$cap" 'BEGIN{print c+10}')"
+    [ -f "$STATE" ] && grep -q "^id=$id\$" "$STATE" 2>/dev/null && restore watchdog
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+
+  # ---- hold ----
+  local t_dead='' ms_dead='-'
+  if [ "$hold" = asap ] && [ "${n_before:-0}" -eq 0 ]; then
+    # Nothing was connected, so there is no socket death to detect.
+    sleep 0.3
+  elif [ "$hold" = asap ]; then
+    # Hold only until every pre-cut socket is gone: the shortest outage that
+    # the app still sees as a dropped connection.
+    while [ "$(since "$t_cut")" -lt "$((cap * 1000))" ]; do
+      if [ -z "$(live_sockets "$proc_match" | grep -x -F -f <(printf '%s\n' "$before") 2>/dev/null)" ]; then
+        t_dead=$(now); break
+      fi
+      sleep 0.05
+    done
+    [ -n "$t_dead" ] && ms_dead=$(since "$t_cut") || ms_dead="cap(${cap}s)"
+  else
+    sleep "$hold"
+  fi
+  local ms_block
+  ms_block=$(since "$t_cut")
+  restore "hold=$hold"
+  # Marker: the network is open again. The hotkey agent clears its indicator
+  # here, so the blue dot tracks the outage and not the reconnect watch.
+  printf '__restored__\n'
+
+  # ---- finish line: the app actually back on the network ----
+  local t_up ms_up='' back=0 pat
+  pat=$(printf '%s\n' $v4 $v6 | sed 's#/.*##')
+  t_up=$(now)
+  while [ "$(since "$t_up")" -lt 30000 ]; do
+    if printf '%s\n' "$(live_sockets "$proc_match" | peers_of)" \
+         | grep -qx -F -f <(printf '%s\n' "$pat") 2>/dev/null; then
+      back=1; ms_up=$(since "$t_up"); break
+    fi
+    sleep 0.05
+  done
+
+  local n4 n6
+  n4=$(printf '%s' "$v4" | wc -w | tr -d ' '); n6=$(printf '%s' "$v6" | wc -w | tr -d ' ')
+  say "cut $label hold=$hold mode=$mode sockets=$n_before blocked=${n4}v4/${n6}v6 skipped=$skipped socket_death=${ms_dead}ms blocked_for=${ms_block}ms reconnect=${ms_up:-none}ms"
+  printf 'cut %s: %s live socket(s), %s addresses blocked\n' "$label" "$n_before" "$((n4 + n6))"
+  printf 'dropped after %sms, network restored after %sms\n' "$ms_dead" "$ms_block"
+  if [ "$back" = 1 ]; then
+    printf 'reconnected %sms after restore  (total outage ~%sms)\n' "$ms_up" "$((ms_block + ms_up))"
+  else
+    printf 'no reconnect seen within 30s - check the app window\n'
+  fi
+}
+
+# do_latch <app spec> <mode>
+# Cuts and stays cut. Returns the moment the block is up — no hold, no
+# measuring — because the second ⌘9 press is what ends it.
+#
+# Default mode is "drop", not "return": a reset tears the connection down and
+# the app then reconnects on its own backoff schedule, which is slow to come
+# back from. Dropped packets leave the connection alive in retransmit, so
+# lifting the block lets the existing sockets resume, which is as close to
+# instant as this can get.
+do_latch() {
+  local spec=$1 mode=${2:-drop} bundle label t0 ms
+  t0=$(now)
+  bundle=$(resolve_app_spec "$spec") || { say "refused: unresolvable app '$spec'"
+    printf 'error: no application matches %s\n' "$spec"; return 1; }
+  label=$(app_label "$bundle")
+  apply_block "$label" "$(proc_match_for "$bundle")" '' '' "$mode" latch || return 1
+
+  # A latch nobody releases still lifts, so a forgotten press cannot strand an
+  # app offline for the rest of the day.
+  ( sleep "$NETCUT_LATCH_CAP"
+    [ -f "$STATE" ] && grep -q "^id=$BLOCK_ID\$" "$STATE" 2>/dev/null && restore "latch cap"
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+
+  ms=$(since "$t0")
+  local n4 n6
+  n4=$(printf '%s' "$BLOCK_V4" | wc -w | tr -d ' ')
+  n6=$(printf '%s' "$BLOCK_V6" | wc -w | tr -d ' ')
+  say "latch $label mode=$mode sockets=$BLOCK_N_BEFORE blocked=${n4}v4/${n6}v6 in=${ms}ms cap=${NETCUT_LATCH_CAP}s"
+  printf '__latched__\n'
+  printf '%s is cut off (%s addresses, %sms)\n' "$label" "$((n4 + n6))" "$ms"
+}
+
+# do_toggle <app spec> <mode>
+# One verb for one key: down if it is up, up if it is down. The daemon decides
+# from the state file, so the hotkey agent can never disagree with the truth.
+do_toggle() {
+  local t0 ms
+  if [ -f "$STATE" ]; then
+    t0=$(now)
+    restore toggle
+    ms=$(since "$t0")
+    printf '__restored__\n'
+    printf 'network restored (%sms)\n' "$ms"
+    return 0
+  fi
+  do_latch "$1" "${2:-drop}"
+}
+
+# do_cut <profile> <hold> <mode>
+do_cut() {
+  local profile=$1 hold=$2 mode=${3:-return}
+  local pfile="$NETCUT_PROFILE_DIR/$profile.conf"
+
+  case "$profile" in
+    ''|*[!A-Za-z0-9._-]*) say "refused: bad profile name"
+      printf 'error: bad profile name\n'; return 1 ;;
+  esac
+  [ -f "$pfile" ] || { say "refused: no profile '$profile'"
+    printf 'error: no profile %s\n' "$profile"; return 1; }
+
+  cut_core "$profile" \
+    "$(profile_get "$pfile" proc_match)" \
+    "$(profile_get "$pfile" hold_domains)" \
+    "$(profile_get "$pfile" hold_cidrs)" \
+    "$hold" "$mode"
+}
+
+# do_cut_app <app spec> <hold> <mode>
+# No profile: the target is found entirely from the sockets it holds right now.
+do_cut_app() {
+  local spec=$1 hold=$2 mode=${3:-return} bundle label
+  bundle=$(resolve_app_spec "$spec") || { say "refused: unresolvable app '$spec'"
+    printf 'error: no application matches %s\n' "$spec"
+    printf '       give a full path to a .app bundle or .exe, or an installed app name\n'
+    return 1; }
+  label=$(app_label "$bundle")
+  cut_core "$label" "$(proc_match_for "$bundle")" '' '' "$hold" "$mode"
+}
+
+# probe <app spec> - what a cut would do. Reads only; never touches pf, and
+# needs no root, so this is the dry run.
+probe() {
+  local spec=$1 bundle label pids before addr fam n=0 skipped=0
+  bundle=$(resolve_app_spec "$spec") || {
+    printf 'error: no application matches %s\n' "$spec"; return 1; }
+  label=$(app_label "$bundle")
+  printf 'target:  %s\n' "$label"
+  printf 'bundle:  %s\n' "$bundle"
+  pids=$(app_pids "$(proc_match_for "$bundle")")
+  printf 'match:   %s\n' "$(proc_match_for "$bundle")"
+  printf 'pids:    %s\n' "${pids:-none (not running)}"
+  [ -n "$pids" ] || return 1
+  before=$(live_sockets "$(proc_match_for "$bundle")")
+  printf 'sockets: %s\n' "$(printf '%s' "$before" | grep -c . | tr -d ' ')"
+  for addr in $(printf '%s\n' "$before" | peers_of); do
+    fam=$(ip_family "$addr"); [ "$fam" = bad ] && continue
+    if guard_ok "$addr" "$fam"; then n=$((n + 1)); printf '  block %s\n' "$addr"
+    else skipped=$((skipped + 1)); printf '  SKIP  %s (guarded)\n' "$addr"; fi
+  done
+  printf 'would block %s address(es), guard refused %s\n' "$n" "$skipped"
+  [ "$n" -gt 0 ]
+}
+
+status() {
+  if [ -f "$STATE" ]; then
+    if grep -q '^hold=latch$' "$STATE" 2>/dev/null; then
+      printf 'LATCHED (down until the next toggle): %s\n' "$(tr '\n' ' ' < "$STATE")"
+    else
+      printf 'cut ACTIVE: %s\n' "$(tr '\n' ' ' < "$STATE")"
+    fi
+  else printf 'no cut active\n'; fi
+  printf 'anchor %s: %s rule(s) loaded\n' "$NETCUT_ANCHOR" \
+    "$(pfctl -a "$NETCUT_ANCHOR" -s rules 2>/dev/null | grep -c . | tr -d ' ')"
+  printf 'profiles: %s\n' "$(ls "$NETCUT_PROFILE_DIR" 2>/dev/null | sed 's/\.conf$//' | tr '\n' ' ')"
+  printf 'app targets: any running application (protocol %s)\n' "$NETCUT_PROTOCOL"
+}
+
+serve() {
+  mkdir -p "$NETCUT_RUN_DIR"; chmod 755 "$NETCUT_RUN_DIR"
+  [ -p "$NETCUT_FIFO" ] || { rm -f "$NETCUT_FIFO"; mkfifo "$NETCUT_FIFO"; }
+  chown "$TRIGGER_USER" "$NETCUT_FIFO"; chmod 600 "$NETCUT_FIFO"
+  touch "$NETCUT_LOG"; chmod 644 "$NETCUT_LOG"
+  rm -f "$NETCUT_RUN_DIR"/reply.*      # nobody is still waiting on those
+  # The client reads this to tell an up-to-date helper from an older one
+  # instead of waiting out a timeout on a verb the helper does not know.
+  printf '%s\n' "$NETCUT_PROTOCOL" > "$NETCUT_RUN_DIR/protocol"
+  chmod 644 "$NETCUT_RUN_DIR/protocol"
+  restore "daemon start"          # never inherit a block across a restart
+  say "netcutd ready (fifo=$NETCUT_FIFO user=$TRIGGER_USER proto=$NETCUT_PROTOCOL max=${NETCUT_MAX_SECONDS}s)"
+
+  # Hold the FIFO open for the life of the daemon. Opening it per iteration
+  # drops anything that arrives between iterations, and a blocking read that
+  # SIGCHLD interrupts loses the line it was reading -- that is what the
+  # "Interrupted system call" lines in netcut.err were, one lost ⌘9 each.
+  # Read-write means the daemon is always a writer too, so the read blocks
+  # instead of seeing EOF.
+  exec 3<> "$NETCUT_FIFO"
+
+  local line verb a1 a2 a3 id reply fails=0
+  while :; do
+    if ! read -r line <&3; then
+      fails=$((fails + 1))
+      [ "$fails" -gt 20 ] && { sleep 0.05; fails=0; }
+      continue
+    fi
+    fails=0
+    if [ -n "$line" ]; then
+      verb=''; a1=''; a2=''; a3=''; id=''
+      # Pipe-delimited so that an empty field stays a field and an app path may
+      # contain spaces. Whitespace splitting silently shifted the request id
+      # into another field whenever an argument was empty.
+      IFS='|' read -r verb a1 a2 a3 id <<< "$line"
+      [ "$a1" = - ] && a1=''
+      [ "$a2" = - ] && a2=''
+      [ "$a3" = - ] && a3=''
+      # The client cannot remove its own reply: this directory is root-owned
+      # so that nothing here can be swapped for a symlink. So the daemon
+      # sweeps what the last requests left behind.
+      find "$NETCUT_RUN_DIR" -name 'reply.*' -mmin +5 -delete 2>/dev/null
+      reply="$NETCUT_RUN_DIR/reply.${id:-nil}"
+      case "$verb" in
+        cut)     { do_cut     "$a1" "${a2:-asap}" "${a3:-return}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
+        app)     { do_cut_app "$a1" "${a2:-asap}" "${a3:-return}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
+        latch)   { do_latch   "$a1" "${a3:-drop}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
+        toggle)  { do_toggle  "$a1" "${a3:-drop}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
+        probe)   { probe      "$a1"; printf '__done__\n'; } > "$reply" 2>&1 ;;
+        restore) { restore requested; printf '__restored__\nrestored\n__done__\n'; } > "$reply" 2>&1 ;;
+        status)  { status; printf '__done__\n'; } > "$reply" 2>&1 ;;
+        *)       say "ignored unknown verb '$verb'"; continue ;;
+      esac
+      chown "$TRIGGER_USER" "$reply" 2>/dev/null
+    fi
+  done
+}
+
+case "${1:-}" in
+  serve)   serve ;;
+  oneshot) shift; do_cut     "${1:-}" "${2:-asap}" "${3:-return}" ;;
+  oneapp)  shift; do_cut_app "${1:-}" "${2:-asap}" "${3:-return}" ;;
+  latch)   shift; do_latch "${1:-}" "${2:-drop}" ;;
+  toggle)  shift; do_toggle "${1:-}" "${2:-drop}" ;;
+  probe)   shift; probe "${1:-}" ;;
+  restore) restore cli ;;
+  status)  status ;;
+  *) printf 'usage: netcutd {serve|oneshot <profile>|oneapp <app>|probe <app>|restore|status} [asap|seconds] [return|drop]\n' >&2; exit 2 ;;
+esac
