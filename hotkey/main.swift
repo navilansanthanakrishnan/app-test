@@ -509,7 +509,10 @@ final class Agent: NSObject, NSMenuDelegate {
             if !hotKeyWorks { return "\(binding.label) is NOT registered — see the log" }
             if !armed {
                 if case .pinned(_, let name) = target {
-                    return "\(binding.label) fires only in \(name) — not in front right now"
+                    // Opening this menu takes focus off the target, so
+                    // "not armed" is always true while you are reading it.
+                    // Say what it means, not what it measures.
+                    return "\(binding.label) works while \(name) is in front (not while this menu is)"
                 }
                 return "\(binding.label) on its own needs an app pinned in Target"
             }
@@ -1112,10 +1115,11 @@ final class Agent: NSObject, NSMenuDelegate {
         let tooltip: String
         switch indicator {
         case .connected:
-            glyph = "●"
-            // Dimmer still when the key is deliberately not listening, so
-            // "nothing happened" is visibly a state and not a failure.
-            color = hotKeyWorks ? (armed ? .tertiaryLabelColor : .quaternaryLabelColor) : .systemOrange
+            // Hollow when the key is not listening. An unarmed press never
+            // reaches this process at all, so the dot is the only thing that
+            // can say so beforehand -- and two shades of grey did not.
+            glyph = armed ? "●" : "○"
+            color = hotKeyWorks ? .tertiaryLabelColor : .systemOrange
             if !hotKeyWorks {
                 tooltip = "netcut — \(binding.label) could not be registered"
             } else if armed {
