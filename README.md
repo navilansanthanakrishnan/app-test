@@ -66,6 +66,7 @@ netcut seconds 18        # auto-reconnect window, 2-120s (menu sets it too)
 netcut pin off           # back to following focus
 netcut app Slack 3       # cut for 3 seconds, then restore by itself
 netcut probe Spotify     # dry run: what it would block, changes nothing
+netcut diag Spotify      # measure what a one-way cut really does to it
 netcut status            # is anything cut right now
 netcut restore           # clear any block
 ```
@@ -98,10 +99,34 @@ in your session table until something times out, and the timeout is usually
 the thing nobody tested. Pointed at your own service, this reproduces it on
 demand.
 
-**It only bites on UDP.** On TCP, blocking one direction stalls the
-connection within a second or two anyway — no ACKs leave, the peer's send
-window fills, and the stream stops. You get a half-open window worth watching
-only where the protocol does not acknowledge, which in practice means UDP.
+**Expect it to look like a full disconnect on most things, and measure
+rather than assume.** `netcut diag <app>` samples the app's real traffic
+before and during a one-way cut and tells you which direction actually
+stopped:
+
+```
+$ netcut diag "Google Chrome" 5
+baseline, 5s ... in 30.9 KB/s   out 175.5 KB/s
+cutting OUTBOUND only for 5s ... in 0 B/s   out 2.7 KB/s
+outbound: stopped, as asked (175.5 KB/s -> 2.7 KB/s)
+inbound:  fell to 0% (30.9 KB/s -> 0 B/s)
+```
+
+The block did exactly what it was told — and inbound still went to zero,
+with no inbound rule loaded. That is the far end going quiet on its own.
+
+Anything that waits on your acknowledgements stops sending when they stop
+arriving. TCP is the obvious case (no ACKs, the peer's send window fills, the
+stream stalls in a second or two), but so is every reliable-UDP game protocol
+— RakNet, ENet, QUIC and friends all have an acknowledgement layer, and their
+congestion control closes the moment you go quiet. So a one-way block on
+those looks like a two-way one, a second or two late.
+
+A genuine half-open window needs a protocol that streams at you
+unconditionally. If yours acknowledges, a hard block is the wrong instrument:
+use one-way *loss* or *delay* (macOS ships `dnctl` for this) so the connection
+degrades instead of stalling, or suppress the payload at the application layer
+and let the heartbeats through.
 
 ## Please don't point this at a multiplayer game
 

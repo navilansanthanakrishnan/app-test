@@ -2,6 +2,7 @@
 # netcut shared helpers. Sourced by netcutd (root) and netcut (unprivileged).
 # No side effects beyond variable definition.
 
+TRIGGER_USER=${TRIGGER_USER:-${NETCUT_TRIGGER_USER:-$(id -un)}}
 NETCUT_RUN_DIR=${NETCUT_RUN_DIR:-/var/run/netcut}
 NETCUT_FIFO=${NETCUT_FIFO:-$NETCUT_RUN_DIR/ctl}
 NETCUT_LOG=${NETCUT_LOG:-/var/log/netcut.log}
@@ -138,6 +139,92 @@ guard_filter() {
       }
       print "4 " addr
     }'
+}
+
+# app_pids <pgrep -f pattern> -> comma-separated pids
+# netcut's own processes are filtered out: an app target is a bundle path, and
+# that same path sits in the argv of the client that asked for the cut, so an
+# unfiltered pgrep would "find" the app even when it is not running.
+app_pids() {
+  ps -axww -o pid=,command= 2>/dev/null | NETCUT_PAT="$1" awk '
+    BEGIN { pat = ENVIRON["NETCUT_PAT"] }
+    $0 ~ pat && index($0, "netcut") == 0 { printf "%s%s", (n++ ? "," : ""), $1 }'
+}
+
+# pg_quote <string> -> the same string, safe as a pgrep/grep ERE literal
+pg_quote() { printf '%s\n' "$1" | sed 's/[][\\.^$*+?(){}|]/\\&/g'; }
+
+# proc_match_for <resolved target> -> the pattern that finds its processes
+# A .app is matched by its full bundle path, which catches every helper inside
+# it. A .exe is matched by filename: the process belongs to Wine, and its argv
+# carries a Windows-style path that never matches the unix one.
+proc_match_for() {
+  case "$1" in
+    *.exe|*.EXE) pg_quote "${1##*/}" ;;
+    *) pg_quote "$1" ;;
+  esac
+}
+
+# resolve_app_spec <spec> -> absolute bundle (or executable) path on stdout
+# Accepts an absolute path to an existing .app bundle, executable or .exe, a
+# bare .exe name, or a bare application name looked up in the standard
+# application directories. Anything else is refused, so a target can never be
+# an arbitrary string.
+resolve_app_spec() {
+  local spec=${1%/} base
+  case "$spec" in
+    *[![:print:]]*) return 1 ;;
+    *'`'*|*'$'*|*';'*|*'&'*|*'|'*|*'<'*|*'>'*|*'"'*|*"'"*) return 1 ;;
+  esac
+  [ -n "$spec" ] || return 1
+  if [ "${spec#/}" != "$spec" ]; then
+    case "$spec" in
+      *.app) [ -d "$spec" ] && { printf '%s\n' "$spec"; return 0; } ;;
+      # A Windows binary under Wine is usually not chmod +x, so the execute
+      # bit is not what makes it a target -- existing on disk is.
+      *.exe|*.EXE) [ -f "$spec" ] && { printf '%s\n' "$spec"; return 0; } ;;
+    esac
+    [ -f "$spec" ] && [ -x "$spec" ] && { printf '%s\n' "$spec"; return 0; }
+    return 1
+  fi
+  # A bare "Game.exe": Wine is what owns the process, so there is no bundle to
+  # find on disk. It stands as the process name and must match something live.
+  case "$spec" in *.exe|*.EXE) printf '%s\n' "$spec"; return 0 ;; esac
+  for base in /Applications "/Users/$TRIGGER_USER/Applications" \
+              /Applications/Utilities /System/Applications \
+              /System/Applications/Utilities /System/Library/CoreServices; do
+    [ -d "$base/$spec.app" ] && { printf '%s\n' "$base/$spec.app"; return 0; }
+  done
+  return 1
+}
+
+# kill_states <v4 list> <v6 list>
+# Open connections match existing pf states and bypass the ruleset, so the
+# states have to be killed for the block to bite. Two forms are needed: `-k
+# host` kills states *originating from* that host, which only covers inbound,
+# so an outbound connection needs `-k <any> -k host`. The wildcard must be of
+# the same family as the address — `0.0.0.0/0` against an IPv6 address is
+# rejected, which is why v6 connections used to survive a cut.
+#
+# Fanned out, bounded at 24 at a time: a browser holds ~90 addresses, and
+# doing these one after another is the slowest part of a cut by far.
+kill_states() {
+  # Two forms are needed: `-k host` kills states originating FROM that host
+  # (inbound), and `-k <any> -k host` kills the outbound ones a client app
+  # actually has. The wildcard must match the family -- 0.0.0.0/0 against an
+  # IPv6 address is rejected, which is why v6 connections once survived.
+  #
+  # pfctl directly under xargs, with no `sh -c` wrapper: that wrapper was an
+  # extra process per address for nothing.
+  if [ -n "$1" ]; then
+    printf '%s\n' $1 | sed 's#/.*##' | xargs -P 24 -n1 pfctl -k >/dev/null 2>&1
+    printf '%s\n' $1 | sed 's#/.*##' | xargs -P 24 -I@ pfctl -k 0.0.0.0/0 -k @ >/dev/null 2>&1
+  fi
+  if [ -n "$2" ]; then
+    printf '%s\n' $2 | sed 's#/.*##' | xargs -P 24 -n1 pfctl -k >/dev/null 2>&1
+    printf '%s\n' $2 | sed 's#/.*##' | xargs -P 24 -I@ pfctl -k ::/0 -k @ >/dev/null 2>&1
+  fi
+  return 0
 }
 
 # first_bundle <executable path> -> the outermost .app, or the basename
