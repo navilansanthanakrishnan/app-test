@@ -213,6 +213,7 @@ $in6"
   { [ -n "$v4" ] && printf 'table <netcut4> persist {%s }\nblock drop quick inet from any to <netcut4>\nblock drop quick inet from <netcut4> to any\n' "$v4"
     [ -n "$v6" ] && printf 'table <netcut6> persist {%s }\nblock drop quick inet6 from any to <netcut6>\nblock drop quick inet6 from <netcut6> to any\n' "$v6"
   } > "$NETCUT_RUN_DIR/exitrules" 2>/dev/null
+  printf '%s\n' "$rules" > "$NETCUT_RUN_DIR/pulserules" 2>/dev/null
 
   BLOCK_V4=$v4; BLOCK_V6=$v6; BLOCK_BEFORE=$before; BLOCK_N_BEFORE=$n_before
   BLOCK_ID=$id; BLOCK_T0=$t_cut; BLOCK_SKIPPED=$skipped
@@ -336,6 +337,25 @@ do_latch() {
   refuse_if_excluded "$bundle" || return 1
   apply_block "$label" "$(proc_match_for "$bundle")" '' '' "$mode" latch "$direction" || return 1
 
+  # Pulse: hand the peer just enough of our traffic to keep it sending.
+  # Without this a solid outbound block starves it of acks and it goes quiet
+  # after a few seconds, which is what capped the useful window at four.
+  if [ "${NETCUT_PULSE_OPEN_MS:-0}" -gt 0 ] && { [ "$direction" = out ] || [ "$direction" = in ]; } \
+     && [ -s "$NETCUT_RUN_DIR/pulserules" ]; then
+    ( closed_ms=$(( ${NETCUT_PULSE_PERIOD_MS:-1000} - NETCUT_PULSE_OPEN_MS ))
+      [ "$closed_ms" -lt 100 ] && closed_ms=100
+      while [ -f "$STATE" ] && grep -q "^id=$BLOCK_ID\$" "$STATE" 2>/dev/null; do
+        awk -v m="$closed_ms" 'BEGIN{ system("sleep " m/1000) }' </dev/null >/dev/null 2>&1
+        [ -f "$STATE" ] && grep -q "^id=$BLOCK_ID\$" "$STATE" 2>/dev/null || break
+        pfctl -a "$NETCUT_ANCHOR" -F rules >/dev/null 2>&1
+        awk -v m="$NETCUT_PULSE_OPEN_MS" 'BEGIN{ system("sleep " m/1000) }' </dev/null >/dev/null 2>&1
+        [ -f "$STATE" ] && grep -q "^id=$BLOCK_ID\$" "$STATE" 2>/dev/null || break
+        pfctl -a "$NETCUT_ANCHOR" -f "$NETCUT_RUN_DIR/pulserules" >/dev/null 2>&1
+      done
+    ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  fi
+
   # A latch nobody releases still lifts, so a forgotten press cannot strand an
   # app offline for the rest of the day.
   ( sleep "$cap"
@@ -351,7 +371,7 @@ do_latch() {
   printf '__latched__ %s\n' "$cap"
   case "$direction" in
     out) printf '%s cannot send (%s addresses, %sms) - its traffic still arrives\n' "$label" "$((n4 + n6))" "$ms"
-         awk -v c="$cap" 'BEGIN{ if (c+0 > 5) print "note: past ~4s the peer stops sending because its acks stopped; a shorter window stays inside that budget" }' ;;
+         awk -v c="$cap" -v p="${NETCUT_PULSE_OPEN_MS:-0}" 'BEGIN{ if (c+0 > 5 && p+0 == 0) print "note: past ~4s the peer stops sending because its acks stopped - netcut pulse 60 keeps it talking for a long window" }' ;;
     delay) printf '%s is sending %sms late (%s addresses, %sms) - it still sees everything live\n' \
              "$label" "$NETCUT_DELAY_MS" "$((n4 + n6))" "$ms" ;;
     in)  printf '%s cannot receive (%s addresses, %sms) - its own packets still leave\n' "$label" "$((n4 + n6))" "$ms" ;;
@@ -462,6 +482,7 @@ serve() {
   # The client reads this to tell an up-to-date helper from an older one
   # instead of waiting out a timeout on a verb the helper does not know.
   NETCUT_DELAY_MS_DEFAULT=$NETCUT_DELAY_MS
+  NETCUT_PULSE_OPEN_MS_DEFAULT=$NETCUT_PULSE_OPEN_MS
   printf '%s\n' "$NETCUT_PROTOCOL" > "$NETCUT_RUN_DIR/protocol"
   chmod 644 "$NETCUT_RUN_DIR/protocol"
   restore "daemon start"          # never inherit a block across a restart
@@ -475,7 +496,7 @@ serve() {
   # instead of seeing EOF.
   exec 3<> "$NETCUT_FIFO"
 
-  local line verb a1 a2 a3 id reply fails=0 dir dms
+  local line verb a1 a2 a3 id reply fails=0 dir dms pul
   while :; do
     if ! read -r line <&3; then
       fails=$((fails + 1))
@@ -484,8 +505,9 @@ serve() {
     fi
     fails=0
     if [ -n "$line" ]; then
-      verb=''; a1=''; a2=''; a3=''; id=''; dir=both; dms=''
+      verb=''; a1=''; a2=''; a3=''; id=''; dir=both; dms=''; pul=''
       NETCUT_DELAY_MS=${NETCUT_DELAY_MS_DEFAULT:-3000}
+      NETCUT_PULSE_OPEN_MS=${NETCUT_PULSE_OPEN_MS_DEFAULT:-0}
       # Pipe-delimited so that an empty field stays a field and an app path may
       # contain spaces. Whitespace splitting silently shifted the request id
       # into another field whenever an argument was empty.
@@ -497,21 +519,27 @@ serve() {
       # so that nothing here can be swapped for a symlink. So the daemon
       # sweeps what the last requests left behind.
       find "$NETCUT_RUN_DIR" -name 'reply.*' -mmin +5 -delete 2>/dev/null
-      # mode may arrive as "drop", "drop:out", or "drop:delay:2500"
-      dir=both
+      # mode[:direction[:delay_ms[:pulse_ms]]]
+      dir=both; dms=''; pul=''
       case "$a3" in
-        *:*:*) dms=${a3##*:}; dir=${a3#*:}; dir=${dir%%:*}; a3=${a3%%:*}
-               printf '%s' "$dms" | grep -qE '^[0-9]+$' \
-                 && [ "$dms" -ge 100 ] && [ "$dms" -le 30000 ] \
-                 && NETCUT_DELAY_MS=$dms ;;
-        *:*)   dir=${a3#*:}; a3=${a3%%:*} ;;
+        *:*) IFS=':' read -r a3 dir dms pul <<< "$a3" ;;
       esac
+      [ -n "$dir" ] || dir=both
+      if printf '%s' "$dms" | grep -qE '^[0-9]+$' \
+         && [ "$dms" -ge 100 ] && [ "$dms" -le 30000 ]; then
+        NETCUT_DELAY_MS=$dms
+      fi
+      # A pulse wider than the period would mean the block is never on.
+      if printf '%s' "$pul" | grep -qE '^[0-9]+$' \
+         && [ "$pul" -ge 0 ] && [ "$pul" -lt "${NETCUT_PULSE_PERIOD_MS:-1000}" ]; then
+        NETCUT_PULSE_OPEN_MS=$pul
+      fi
       reply="$NETCUT_RUN_DIR/reply.${id:-nil}"
       case "$verb" in
         cut)     { do_cut     "$a1" "${a2:-asap}" "${a3:-return}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
         app)     { do_cut_app "$a1" "${a2:-asap}" "${a3:-return}" "$dir"; printf '__done__\n'; } > "$reply" 2>&1 ;;
         latch|toggle)
-          say "$verb request target='$a1' window='${a2:-default}' mode='${a3:-drop}' dir='$dir'${dms:+ delay=${dms}ms}"
+          say "$verb request target='$a1' window='${a2:-default}' mode='${a3:-drop}' dir='$dir'${dms:+ delay=${dms}ms}${pul:+ pulse=${pul}ms}"
           if [ "$verb" = latch ]; then
             { do_latch "$a1" "${a3:-drop}" "$a2" "$dir"; printf '__done__\n'; } > "$reply" 2>&1
           else

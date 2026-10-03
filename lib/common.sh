@@ -17,10 +17,11 @@ NETCUT_MAX_SECONDS=${NETCUT_MAX_SECONDS:-120}
 # 5 = the caller may ask for that window.
 # 6 = the mode field may carry a direction, as mode:direction.
 # 7 = direction may be "delay", served by a dummynet pipe rather than a block.
+# 8 = the mode field may carry a pulse width as a fourth component.
 # netcutd publishes the version it speaks in $NETCUT_RUN_DIR/protocol so the
 # client can tell an old installed helper from a current one without waiting
 # out a timeout on a verb that helper answers with silence.
-NETCUT_PROTOCOL=${NETCUT_PROTOCOL:-7}
+NETCUT_PROTOCOL=${NETCUT_PROTOCOL:-8}
 NETCUT_LATCH_CAP=${NETCUT_LATCH_CAP:-20}     # default auto-reenable, seconds
 NETCUT_LATCH_MIN=${NETCUT_LATCH_MIN:-2}      # a request below this is clamped up
 # direction=delay holds outbound packets in a dummynet pipe instead of
@@ -32,6 +33,14 @@ NETCUT_DELAY_MS=${NETCUT_DELAY_MS:-3000}
 # is fast; with only outbound blocked it never notices anything was wrong,
 # so on release it limps back instead. This hands it the clean signal.
 NETCUT_EXIT_BLIP_MS=${NETCUT_EXIT_BLIP_MS:-250}
+
+# Pulsing a one-way cut. A solid outbound block starves the peer of acks and
+# it stops sending after a few seconds, which caps the useful window at
+# about four. Opening the block for a few tens of milliseconds each second
+# lets just enough through to keep the peer talking, at the cost of some of
+# our own traffic escaping in those gaps. 0 = off (a solid block).
+NETCUT_PULSE_OPEN_MS=${NETCUT_PULSE_OPEN_MS:-0}
+NETCUT_PULSE_PERIOD_MS=${NETCUT_PULSE_PERIOD_MS:-1000}
 NETCUT_PIPE=${NETCUT_PIPE:-57}               # dummynet pipe number we own
 # The queue must hold delay x packet-rate or the pipe tail-drops and the link
 # dies anyway -- 3s at 60pps is ~180 packets. dummynet caps the SLOT form at

@@ -6,6 +6,8 @@
 #   netcut front             blip: cut whatever is in front, straight back
 #   netcut app Discord       blip a named application (or a full .app path)
 #   netcut pin Discord       attach ⌘9 to that app; it stops following focus
+#   netcut pulse 60          keep a long one-way cut alive: open the block
+#                            60ms each second so the peer keeps sending
 #   netcut direction delay   its packets arrive late instead of not at all:
 #                            it still sees everything live, the peer sees it
 #                            stale. netcut delayms 3000 sets how late.
@@ -95,6 +97,34 @@ NETCUT_SECONDS=${NETCUT_SECONDS:-$HOME/.config/netcut/seconds}
 NETCUT_KEY=${NETCUT_KEY:-$HOME/.config/netcut/key}
 NETCUT_DIRECTION=${NETCUT_DIRECTION:-$HOME/.config/netcut/direction}
 NETCUT_DELAYMS_FILE=${NETCUT_DELAYMS_FILE:-$HOME/.config/netcut/delayms}
+NETCUT_PULSE_FILE=${NETCUT_PULSE_FILE:-$HOME/.config/netcut/pulse}
+
+pulse_get() {
+  local n
+  n=$(cat "$NETCUT_PULSE_FILE" 2>/dev/null | tr -dc '0-9')
+  printf '%s\n' "${n:-0}"
+}
+
+pulse_show() {
+  local n; n=$(pulse_get)
+  if [ "$n" = 0 ]; then
+    printf 'pulse off: a solid block, so the peer goes quiet after ~4s\n'
+  else
+    printf 'pulse %sms per second: enough gets through to keep the peer sending\n' "$n"
+    printf '         (some of your own traffic escapes in those gaps)\n'
+  fi
+}
+
+pulse_set() {
+  case "$1" in
+    off|none|0) printf '0\n' > "$NETCUT_PULSE_FILE"; pulse_show; return ;;
+  esac
+  printf '%s' "$1" | grep -qE '^[0-9]+$' || die "give milliseconds, or 'off'"
+  [ "$1" -ge 10 ] && [ "$1" -le 500 ] || die "pulse must be 10-500ms (or off)"
+  mkdir -p "$(dirname "$NETCUT_PULSE_FILE")" || die "could not write it"
+  printf '%s\n' "$1" > "$NETCUT_PULSE_FILE" || die "could not write it"
+  pulse_show
+}
 
 delayms_get() {
   local n
@@ -332,13 +362,19 @@ request() {
 
 case "${1:-}" in
   ''|-h|--help|help)
-    sed -n '2,31p' "$0" | sed 's/^#\{1,\} \{0,1\}//'
+    sed -n '2,33p' "$0" | sed 's/^#\{1,\} \{0,1\}//'
     printf 'profiles: %s\n' "$(profiles)"
     ;;
   status)  request status ;;
   restore) request restore ;;
   apps)    p=$(profiles); [ -n "$p" ] && printf '%s\n' $p || die "no profiles installed" ;;
   running) running_apps | sed 's#.*/##; s/\.app$//' ;;
+  pulse)
+    case "${2:-}" in
+      '') pulse_show ;;
+      *)  pulse_set "$2" ;;
+    esac
+    ;;
   delayms)
     case "${2:-}" in
       '') printf 'delay mode holds packets %sms\n' "$(delayms_get)" ;;
@@ -381,11 +417,11 @@ case "${1:-}" in
         frontmost|'') spec=$(frontmost) || die "could not tell which application is in front" ;;
       esac
     fi
-    request toggle "$spec" "$(seconds_get)" "${3:-drop}:$(direction_get):$(delayms_get)"
+    request toggle "$spec" "$(seconds_get)" "${3:-drop}:$(direction_get):$(delayms_get):$(pulse_get)"
     ;;
   hold)
     [ -n "${2:-}" ] || die "hold needs an application"
-    request latch "$2" "$(seconds_get)" "${3:-drop}:$(direction_get):$(delayms_get)"
+    request latch "$2" "$(seconds_get)" "${3:-drop}:$(direction_get):$(delayms_get):$(pulse_get)"
     ;;
   front)
     case "${3:-return}" in
@@ -394,7 +430,7 @@ case "${1:-}" in
     esac
     app=$(frontmost) || die "could not tell which application is in front"
     printf 'front: %s\n' "$(printf '%s' "${app##*/}" | sed 's/\.app$//')"
-    request app "$app" "${2:-$NETCUT_DEFAULT_HOLD}" "${3:-return}:$(direction_get):$(delayms_get)"
+    request app "$app" "${2:-$NETCUT_DEFAULT_HOLD}" "${3:-return}:$(direction_get):$(delayms_get):$(pulse_get)"
     ;;
   app)
     [ -n "${2:-}" ] || die "app needs a name or a .app path"
@@ -402,7 +438,7 @@ case "${1:-}" in
       return|drop) ;;
       *) die "mode must be 'return' (instant reset) or 'drop' (silent)" ;;
     esac
-    request app "$2" "${3:-$NETCUT_DEFAULT_HOLD}" "${4:-return}:$(direction_get):$(delayms_get)"
+    request app "$2" "${3:-$NETCUT_DEFAULT_HOLD}" "${4:-return}:$(direction_get):$(delayms_get):$(pulse_get)"
     ;;
   *)
     profile=$1; hold=${2:-$NETCUT_DEFAULT_HOLD}; mode=${3:-return}

@@ -63,6 +63,7 @@ From a terminal, if you prefer:
 ```sh
 netcut toggle            # same as ⌘9
 netcut pin Discord       # attach ⌘9 to one app so it stops following focus
+netcut pulse 60          # keep a LONG one-way cut alive (see below)
 netcut direction delay   # packets arrive late instead of not at all
 netcut delayms 3000      # how late
 netcut direction out     # half-open: it cannot send, the peer's traffic arrives
@@ -134,6 +135,19 @@ unconditionally. If yours acknowledges, a hard block is the wrong instrument:
 use one-way *loss* or *delay* (macOS ships `dnctl` for this) so the connection
 degrades instead of stalling, or suppress the payload at the application layer
 and let the heartbeats through.
+
+## Pulse — holding a one-way cut open for longer than a few seconds
+
+A solid outbound block starves the peer of acknowledgements, and after a few
+seconds it concludes you are gone and stops sending. That is what caps a
+one-way cut at around four useful seconds, whatever window you set.
+
+`netcut pulse 60` opens the block for 60ms each second. Just enough gets
+through to keep the peer talking, so the view stays live for a window of any
+length. The cost is honest: some of your own traffic escapes in those gaps,
+so instead of being perfectly frozen at the far end you move in steps.
+Shorter pulse means less leaks and more risk the peer still gives up; 40-80ms
+is the range worth trying. `netcut pulse off` returns to a solid block.
 
 ## Delay mode — the one that keeps the view alive
 

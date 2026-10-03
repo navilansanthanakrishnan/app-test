@@ -69,7 +69,7 @@ func logLine(_ message: String) {
 enum NetcutClient {
     static let runDir = "/var/run/netcut"
     static let fifoPath = "\(runDir)/ctl"
-    static let protocolNeeded = 7
+    static let protocolNeeded = 8
 
     struct Reply {
         let ok: Bool
@@ -174,6 +174,18 @@ enum KeyBinding: String, CaseIterable {
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? (rawValue + "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+/// How long the block opens each second to keep the peer talking. 0 = a
+/// solid block, which the peer stops answering after a few seconds.
+enum Pulse {
+    static var path: String { "\(home)/.config/netcut/pulse" }
+    static func load() -> Int {
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let n = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return 0 }
+        return (n == 0 || (n >= 10 && n <= 500)) ? n : 0
     }
 }
 
@@ -961,7 +973,7 @@ final class Agent: NSObject, NSMenuDelegate {
         seconds = AutoReconnect.load()
         direction = Direction.load()
         run(arguments: ["--markers", "toggle", bundlePath,
-                        "drop:\(direction.rawValue):\(DelayMs.load())"],
+                        "drop:\(direction.rawValue):\(DelayMs.load()):\(Pulse.load())"],
             label: name, seconds: seconds) { [weak self] code, output in
             MainActor.assumeIsolated { self?.finish(name: name, code: code, output: output) }
         }
