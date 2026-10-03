@@ -145,10 +145,14 @@ GUARD
       # keeps sending because our acks do arrive, just late, so the view
       # stays live while everything we say lands stale. /etc/pf.conf already
       # declares dummynet-anchor "com.apple/*", so this needs no system edit.
-      dnctl pipe "$NETCUT_PIPE" config delay "$NETCUT_DELAY_MS" \
-        queue "$NETCUT_PIPE_SLOTS" >/dev/null 2>&1 || {
-          say "FAILED dnctl pipe config"
-          printf 'error: could not configure the delay pipe\n'; return 1; }
+      # Keep dnctl's own words. Discarding them is how "queue 800" sat here
+      # as an unexplained FAILED line instead of "2 <= queue size <= 100".
+      local dn_err
+      dn_err=$(dnctl pipe "$NETCUT_PIPE" config \
+                 delay "${NETCUT_DELAY_MS}ms" queue "$NETCUT_PIPE_QUEUE" 2>&1) || {
+          say "FAILED dnctl pipe config: $dn_err"
+          printf 'error: could not configure the delay pipe: %s\n' "$dn_err"
+          return 1; }
       out4="dummynet out quick inet from any to <netcut4> pipe $NETCUT_PIPE"
       out6="dummynet out quick inet6 from any to <netcut6> pipe $NETCUT_PIPE" ;;
     out)  out4="$b out quick inet from any to <netcut4>"

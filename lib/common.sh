@@ -28,9 +28,11 @@ NETCUT_LATCH_MIN=${NETCUT_LATCH_MIN:-2}      # a request below this is clamped u
 # acks do eventually arrive -- while everything we send lands late.
 NETCUT_DELAY_MS=${NETCUT_DELAY_MS:-3000}
 NETCUT_PIPE=${NETCUT_PIPE:-57}               # dummynet pipe number we own
-# Slots must hold delay x packet-rate or the pipe tail-drops and the link
-# dies anyway: 3s at 60pps is 180 packets, and the default is 50.
-NETCUT_PIPE_SLOTS=${NETCUT_PIPE_SLOTS:-800}
+# The queue must hold delay x packet-rate or the pipe tail-drops and the link
+# dies anyway -- 3s at 60pps is ~180 packets. dummynet caps the SLOT form at
+# 100 ("dnctl: 2 <= queue size <= 100"), so this is the byte form, which is
+# not capped the same way. ~36KB would do; 500K is headroom.
+NETCUT_PIPE_QUEUE=${NETCUT_PIPE_QUEUE:-500Kbytes}
 # The chosen value lives in the user's config so the menu, the CLI and the
 # daemon all read one number; the daemon clamps whatever it is handed.
 NETCUT_SECONDS_FILE=${NETCUT_SECONDS_FILE:-.config/netcut/seconds}
