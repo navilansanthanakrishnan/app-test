@@ -483,6 +483,7 @@ serve() {
   # instead of waiting out a timeout on a verb the helper does not know.
   NETCUT_DELAY_MS_DEFAULT=$NETCUT_DELAY_MS
   NETCUT_PULSE_OPEN_MS_DEFAULT=$NETCUT_PULSE_OPEN_MS
+  NETCUT_PULSE_PERIOD_MS_DEFAULT=$NETCUT_PULSE_PERIOD_MS
   printf '%s\n' "$NETCUT_PROTOCOL" > "$NETCUT_RUN_DIR/protocol"
   chmod 644 "$NETCUT_RUN_DIR/protocol"
   restore "daemon start"          # never inherit a block across a restart
@@ -496,7 +497,7 @@ serve() {
   # instead of seeing EOF.
   exec 3<> "$NETCUT_FIFO"
 
-  local line verb a1 a2 a3 id reply fails=0 dir dms pul
+  local line verb a1 a2 a3 id reply fails=0 dir dms pul pper
   while :; do
     if ! read -r line <&3; then
       fails=$((fails + 1))
@@ -508,6 +509,7 @@ serve() {
       verb=''; a1=''; a2=''; a3=''; id=''; dir=both; dms=''; pul=''
       NETCUT_DELAY_MS=${NETCUT_DELAY_MS_DEFAULT:-3000}
       NETCUT_PULSE_OPEN_MS=${NETCUT_PULSE_OPEN_MS_DEFAULT:-0}
+      NETCUT_PULSE_PERIOD_MS=${NETCUT_PULSE_PERIOD_MS_DEFAULT:-1000}
       # Pipe-delimited so that an empty field stays a field and an app path may
       # contain spaces. Whitespace splitting silently shifted the request id
       # into another field whenever an argument was empty.
@@ -529,17 +531,22 @@ serve() {
          && [ "$dms" -ge 100 ] && [ "$dms" -le 30000 ]; then
         NETCUT_DELAY_MS=$dms
       fi
-      # A pulse wider than the period would mean the block is never on.
+      # "open" or "open/period", both ms. A pulse as wide as its period
+      # would mean the block is never actually on.
+      pper=${NETCUT_PULSE_PERIOD_MS:-1000}
+      case "$pul" in */*) pper=${pul#*/}; pul=${pul%%/*} ;; esac
       if printf '%s' "$pul" | grep -qE '^[0-9]+$' \
-         && [ "$pul" -ge 0 ] && [ "$pul" -lt "${NETCUT_PULSE_PERIOD_MS:-1000}" ]; then
+         && printf '%s' "$pper" | grep -qE '^[0-9]+$' \
+         && [ "$pul" -ge 0 ] && [ "$pper" -ge 100 ] && [ "$pul" -lt "$pper" ]; then
         NETCUT_PULSE_OPEN_MS=$pul
+        NETCUT_PULSE_PERIOD_MS=$pper
       fi
       reply="$NETCUT_RUN_DIR/reply.${id:-nil}"
       case "$verb" in
         cut)     { do_cut     "$a1" "${a2:-asap}" "${a3:-return}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
         app)     { do_cut_app "$a1" "${a2:-asap}" "${a3:-return}" "$dir"; printf '__done__\n'; } > "$reply" 2>&1 ;;
         latch|toggle)
-          say "$verb request target='$a1' window='${a2:-default}' mode='${a3:-drop}' dir='$dir'${dms:+ delay=${dms}ms}${pul:+ pulse=${pul}ms}"
+          say "$verb request target='$a1' window='${a2:-default}' mode='${a3:-drop}' dir='$dir'${dms:+ delay=${dms}ms}${pul:+ pulse=${pul}/${pper}ms}"
           if [ "$verb" = latch ]; then
             { do_latch "$a1" "${a3:-drop}" "$a2" "$dir"; printf '__done__\n'; } > "$reply" 2>&1
           else

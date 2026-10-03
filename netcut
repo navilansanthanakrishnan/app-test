@@ -99,30 +99,39 @@ NETCUT_DIRECTION=${NETCUT_DIRECTION:-$HOME/.config/netcut/direction}
 NETCUT_DELAYMS_FILE=${NETCUT_DELAYMS_FILE:-$HOME/.config/netcut/delayms}
 NETCUT_PULSE_FILE=${NETCUT_PULSE_FILE:-$HOME/.config/netcut/pulse}
 
+# Stored as "open" or "open/period", both in ms.
 pulse_get() {
-  local n
-  n=$(cat "$NETCUT_PULSE_FILE" 2>/dev/null | tr -dc '0-9')
-  printf '%s\n' "${n:-0}"
+  local v
+  v=$(cat "$NETCUT_PULSE_FILE" 2>/dev/null | tr -dc '0-9/')
+  printf '%s\n' "${v:-0}"
 }
+pulse_open()   { printf '%s\n' "$(pulse_get)" | cut -d/ -f1; }
+pulse_period() { local v; v=$(pulse_get); case "$v" in */*) printf '%s\n' "${v#*/}" ;; *) printf '1000\n' ;; esac; }
 
 pulse_show() {
-  local n; n=$(pulse_get)
-  if [ "$n" = 0 ]; then
+  local o p
+  o=$(pulse_open); p=$(pulse_period)
+  if [ "${o:-0}" = 0 ]; then
     printf 'pulse off: a solid block, so the peer goes quiet after ~4s\n'
   else
-    printf 'pulse %sms per second: enough gets through to keep the peer sending\n' "$n"
-    printf '         (some of your own traffic escapes in those gaps)\n'
+    printf 'pulse: open %sms every %sms (%s%% of the time)\n' "$o" "$p" "$(( o * 100 / p ))"
+    printf '       that %s%% is also how much of your own traffic gets out\n' "$(( o * 100 / p ))"
   fi
 }
 
 pulse_set() {
+  local o p
+  mkdir -p "$(dirname "$NETCUT_PULSE_FILE")" || die "could not write it"
   case "$1" in
     off|none|0) printf '0\n' > "$NETCUT_PULSE_FILE"; pulse_show; return ;;
   esac
-  printf '%s' "$1" | grep -qE '^[0-9]+$' || die "give milliseconds, or 'off'"
-  [ "$1" -ge 10 ] && [ "$1" -le 500 ] || die "pulse must be 10-500ms (or off)"
-  mkdir -p "$(dirname "$NETCUT_PULSE_FILE")" || die "could not write it"
-  printf '%s\n' "$1" > "$NETCUT_PULSE_FILE" || die "could not write it"
+  o=${1%%/*}; p=1000
+  case "$1" in */*) p=${1#*/} ;; esac
+  printf '%s' "$o$p" | grep -qE '^[0-9]+$' || die "give open[/period] in ms, or 'off'"
+  [ "$o" -ge 10 ] && [ "$o" -le 500 ] || die "open must be 10-500ms"
+  [ "$p" -ge 100 ] && [ "$p" -le 5000 ] || die "period must be 100-5000ms"
+  [ "$o" -lt "$p" ] || die "open must be shorter than the period"
+  printf '%s/%s\n' "$o" "$p" > "$NETCUT_PULSE_FILE" || die "could not write it"
   pulse_show
 }
 
@@ -417,11 +426,11 @@ case "${1:-}" in
         frontmost|'') spec=$(frontmost) || die "could not tell which application is in front" ;;
       esac
     fi
-    request toggle "$spec" "$(seconds_get)" "${3:-drop}:$(direction_get):$(delayms_get):$(pulse_get)"
+    request toggle "$spec" "$(seconds_get)" "${3:-drop}:$(direction_get):$(delayms_get):$(pulse_open)/$(pulse_period)"
     ;;
   hold)
     [ -n "${2:-}" ] || die "hold needs an application"
-    request latch "$2" "$(seconds_get)" "${3:-drop}:$(direction_get):$(delayms_get):$(pulse_get)"
+    request latch "$2" "$(seconds_get)" "${3:-drop}:$(direction_get):$(delayms_get):$(pulse_open)/$(pulse_period)"
     ;;
   front)
     case "${3:-return}" in
@@ -430,7 +439,7 @@ case "${1:-}" in
     esac
     app=$(frontmost) || die "could not tell which application is in front"
     printf 'front: %s\n' "$(printf '%s' "${app##*/}" | sed 's/\.app$//')"
-    request app "$app" "${2:-$NETCUT_DEFAULT_HOLD}" "${3:-return}:$(direction_get):$(delayms_get):$(pulse_get)"
+    request app "$app" "${2:-$NETCUT_DEFAULT_HOLD}" "${3:-return}:$(direction_get):$(delayms_get):$(pulse_open)/$(pulse_period)"
     ;;
   app)
     [ -n "${2:-}" ] || die "app needs a name or a .app path"
@@ -438,7 +447,7 @@ case "${1:-}" in
       return|drop) ;;
       *) die "mode must be 'return' (instant reset) or 'drop' (silent)" ;;
     esac
-    request app "$2" "${3:-$NETCUT_DEFAULT_HOLD}" "${4:-return}:$(direction_get):$(delayms_get):$(pulse_get)"
+    request app "$2" "${3:-$NETCUT_DEFAULT_HOLD}" "${4:-return}:$(direction_get):$(delayms_get):$(pulse_open)/$(pulse_period)"
     ;;
   *)
     profile=$1; hold=${2:-$NETCUT_DEFAULT_HOLD}; mode=${3:-return}
