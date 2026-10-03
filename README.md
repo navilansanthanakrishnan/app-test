@@ -187,30 +187,51 @@ owned, so changing it is a deliberate privileged edit followed by a
 reinstall — which is the point. Testing your own service is what this is for;
 those are not your own service.
 
-## Not for public game servers. Not for inexperienced users.
+## Only on something you own. This one is not advisory.
 
-**Do not use this in Roblox public servers, or in any multiplayer session
-with other people in it.** Not in one-way mode, not in both-ways mode, not
-"just to test". This tool exists for people breaking their *own* services on
-purpose, on machines and servers they own.
+**Do not point this at a game you do not own.** Not a public server, not
+someone else's experience, not a match with other players in it, not "just
+to see". If you did not make the thing on the other end, this tool is not
+for you and there is no reading of it that makes it fine.
 
-Why it matters, once, plainly: cutting a client mid-session desyncs it from
-the server, and the cost of that desync is paid by the other players in the
-session — they see you freeze, teleport, or trade hits that already
-happened. They did not opt into your test. Anti-cheat also reads a repeating
-connection drop from one client as exactly what it resembles, and the ban
-lands on the account, not on the tool.
+**The one case it is for:** a service or a game you built, in a private or
+solo session, with nobody else connected. That is where breaking the
+connection on purpose costs nothing to anyone but you — which is the entire
+difference between testing and cheating. A private place of your own with
+one player in it is testing. The same keystroke in a public match is not,
+and the fact that the tool cannot tell them apart is exactly why this is
+written down.
 
-**This assumes you know what you are doing.** It loads firewall rules as
-root, blocks by address rather than by process, and will take down anything
-else talking to the same addresses for the length of the cut. If you are not
-comfortable reading `pfctl -a com.apple/netcut -s rules` and reasoning about
-what a dropped packet does to your protocol, this is the wrong tool to be
-pointing at anything.
+Cutting a client mid-session desyncs it from the server. In a shared session
+the other players pay for that desync — they see you freeze, teleport, or
+trade hits that already landed — and they did not agree to be part of your
+test. Anti-cheat also reads a repeating drop from one client as what it
+resembles, and the ban lands on the account, not on the tool.
 
-There is no check enforcing any of this. That is deliberate — a tool for
-breaking your own things cannot tell whose things they are — so it is stated
-here instead, which makes it your call and your responsibility.
+`exclusions.txt` is the enforced half of this: targets on that list are
+refused before any firewall rule is written, and it ships with the
+commercial multiplayer clients in it. It is installed root-owned, and from
+this version the installer **will not overwrite a list you have curated** —
+the shipped copy lands as `exclusions.txt.default` and is only promoted if
+nothing is installed yet. Removing an entry is a deliberate, privileged act.
+Own that decision.
+
+**It also assumes you know what you are doing.** It loads firewall rules as
+root, blocks by address rather than by process, and takes down anything else
+talking to those addresses for the length of the cut.
+
+### If you are testing an anti-cheat, read this first
+
+A server-side detector sees one thing: the client stopped sending, and then
+its position jumped. **It cannot tell a one-way cut from a two-way one** —
+the difference between them is only what *your own screen* shows you, and
+your detector does not run on your screen.
+
+So the fiddly asymmetric mode is not the one to validate against. Use the
+plain both-ways cut: it is instantaneous, it is the best-tested path here,
+and it produces exactly the server-side signature you are trying to catch.
+If you find yourself needing the client's view to look right, you have
+stopped testing the detector and started tuning the exploit.
 
 ## How it works
 
