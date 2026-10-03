@@ -63,6 +63,8 @@ From a terminal, if you prefer:
 ```sh
 netcut toggle            # same as ⌘9
 netcut pin Discord       # attach ⌘9 to one app so it stops following focus
+netcut direction delay   # packets arrive late instead of not at all
+netcut delayms 3000      # how late
 netcut direction out     # half-open: it cannot send, the peer's traffic arrives
 netcut direction both    # a full disconnect (the default)
 netcut key grave         # fire on backtick instead: cmd9 | q | grave
@@ -132,6 +134,37 @@ unconditionally. If yours acknowledges, a hard block is the wrong instrument:
 use one-way *loss* or *delay* (macOS ships `dnctl` for this) so the connection
 degrades instead of stalling, or suppress the payload at the application layer
 and let the heartbeats through.
+
+## Delay mode — the one that keeps the view alive
+
+A block is binary, and that is why one-way blocking collapses: stop
+acknowledging and the peer stops sending, so you lose the view you were
+trying to keep. **Delaying is not binary.** Your packets still arrive, just
+late, so the link never dies — the peer keeps streaming to you while
+everything you send lands stale.
+
+```sh
+netcut direction delay
+netcut delayms 3000      # how late, 100-30000ms
+```
+
+Then the hotkey: you see the world live and in real time, and the far end
+sees you where you were three seconds ago. Press again and the delay lifts.
+
+It is a dummynet pipe rather than a firewall rule — `/etc/pf.conf` already
+declares `dummynet-anchor "com.apple/*"`, so it loads into the same anchor
+as everything else and still edits no system file. Inbound is never touched,
+and the pf states are deliberately **not** killed in this mode, because the
+flow is the thing being kept alive.
+
+Two things to know before relying on it:
+
+- **Your own round trips take the hit too.** You see the world live, but
+  anything of yours that needs a reply — a hit registering, a purchase, a
+  door opening — comes back `delayms` later.
+- **Stay under the peer's timeout.** 2–3 seconds is a lag spike. Ten is a
+  disconnect, and then you are back to the behaviour you were trying to
+  avoid.
 
 ## lab/netcut-lab — when a firewall is the wrong instrument
 

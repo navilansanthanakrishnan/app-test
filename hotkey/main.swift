@@ -69,7 +69,7 @@ func logLine(_ message: String) {
 enum NetcutClient {
     static let runDir = "/var/run/netcut"
     static let fifoPath = "\(runDir)/ctl"
-    static let protocolNeeded = 6
+    static let protocolNeeded = 7
 
     struct Reply {
         let ok: Bool
@@ -177,6 +177,18 @@ enum KeyBinding: String, CaseIterable {
     }
 }
 
+/// How late `delay` mode makes outbound packets, in milliseconds.
+enum DelayMs {
+    static let fallback = 3000
+    static var path: String { "\(home)/.config/netcut/delayms" }
+    static func load() -> Int {
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let n = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return fallback }
+        return Swift.min(Swift.max(n, 100), 30000)
+    }
+}
+
 /// Which way the block runs.
 ///
 /// `both` is an ordinary disconnect. `out` leaves the peer's packets arriving
@@ -184,20 +196,22 @@ enum KeyBinding: String, CaseIterable {
 /// state a server's own timeout handling is easiest to get wrong on. `in` is
 /// the mirror.
 enum Direction: String, CaseIterable {
-    case both, out, `in`
+    case both, out, `in`, delay
 
     var label: String {
         switch self {
-        case .both: return "Both ways (a full disconnect)"
-        case .out:  return "Outbound only (it cannot send)"
-        case .in:   return "Inbound only (it cannot receive)"
+        case .both:  return "Both ways (a full disconnect)"
+        case .delay: return "Delay outbound (you see live, they see you stale)"
+        case .out:   return "Outbound only (it cannot send)"
+        case .in:    return "Inbound only (it cannot receive)"
         }
     }
     var short: String {
         switch self {
-        case .both: return "both ways"
-        case .out:  return "cannot send"
-        case .in:   return "cannot receive"
+        case .both:  return "both ways"
+        case .delay: return "sending late"
+        case .out:   return "cannot send"
+        case .in:    return "cannot receive"
         }
     }
 
@@ -559,8 +573,9 @@ final class Agent: NSObject, NSMenuDelegate {
             sub.addItem(item)
         }
         sub.addItem(.separator())
-        let note = NSMenuItem(title: "One-way only bites on UDP; TCP stalls either way",
-                              action: nil, keyEquivalent: "")
+        let note = NSMenuItem(
+            title: "Delay keeps the link alive; a one-way block does not",
+            action: nil, keyEquivalent: "")
         note.isEnabled = false
         sub.addItem(note)
     }
@@ -942,7 +957,8 @@ final class Agent: NSObject, NSMenuDelegate {
 
         seconds = AutoReconnect.load()
         direction = Direction.load()
-        run(arguments: ["--markers", "toggle", bundlePath, "drop:\(direction.rawValue)"],
+        run(arguments: ["--markers", "toggle", bundlePath,
+                        "drop:\(direction.rawValue):\(DelayMs.load())"],
             label: name, seconds: seconds) { [weak self] code, output in
             MainActor.assumeIsolated { self?.finish(name: name, code: code, output: output) }
         }

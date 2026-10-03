@@ -41,6 +41,8 @@ restore() {   # idempotent; safe when nothing is cut
   local reason=${1:-manual} token=''
   [ -f "$STATE" ] && token=$(sed -n 's/^token=//p' "$STATE")
   pfctl -a "$NETCUT_ANCHOR" -F all >/dev/null 2>&1
+  # Rule first, then the pipe: a packet must never meet a pipe that is gone.
+  dnctl pipe "$NETCUT_PIPE" delete >/dev/null 2>&1
   [ -n "$token" ] && pfctl -X "$token" >/dev/null 2>&1
   rm -f "$STATE"
   say "restore ($reason)"
@@ -89,9 +91,9 @@ apply_block() {
   # function; it used to be checked only in cut_core, so a latch with a
   # nonsense direction quietly became a full block.
   case "$direction" in
-    both|out|in) ;;
+    both|out|in|delay) ;;
     *) say "refused: bad direction '$direction'"
-       printf 'error: direction must be both, out or in\n'; return 1 ;;
+       printf 'error: direction must be both, out, in or delay\n'; return 1 ;;
   esac
   BLOCK_V4=''; BLOCK_V6=''; BLOCK_BEFORE=''; BLOCK_N_BEFORE=0
   BLOCK_ID=''; BLOCK_T0=''; BLOCK_SKIPPED=0
@@ -137,6 +139,18 @@ GUARD
   # first and produced "block drop quick out inet", which pf rejects.
   local rules='' b="block $mode" out4='' in4='' out6='' in6=''
   case "$direction" in
+    delay)
+      # Not a block at all. Outbound packets go into a dummynet pipe and
+      # come out $NETCUT_DELAY_MS later; inbound is never touched. The peer
+      # keeps sending because our acks do arrive, just late, so the view
+      # stays live while everything we say lands stale. /etc/pf.conf already
+      # declares dummynet-anchor "com.apple/*", so this needs no system edit.
+      dnctl pipe "$NETCUT_PIPE" config delay "$NETCUT_DELAY_MS" \
+        queue "$NETCUT_PIPE_SLOTS" >/dev/null 2>&1 || {
+          say "FAILED dnctl pipe config"
+          printf 'error: could not configure the delay pipe\n'; return 1; }
+      out4="dummynet out quick inet from any to <netcut4> pipe $NETCUT_PIPE"
+      out6="dummynet out quick inet6 from any to <netcut6> pipe $NETCUT_PIPE" ;;
     out)  out4="$b out quick inet from any to <netcut4>"
           out6="$b out quick inet6 from any to <netcut6>" ;;
     in)   in4="$b in quick inet from <netcut4> to any"
@@ -168,7 +182,9 @@ $in6"
   printf 'id=%s\ntoken=%s\ntarget=%s\nhold=%s\nmode=%s\ndirection=%s\n' \
     "$id" "$token" "$label" "$tag" "$mode" "$direction" > "$STATE"
 
-  kill_states "$v4" "$v6"
+  # A delay is not a disconnect: killing the states would tear down the very
+  # flow we are trying to keep alive.
+  [ "$direction" = delay ] || kill_states "$v4" "$v6"
 
   BLOCK_V4=$v4; BLOCK_V6=$v6; BLOCK_BEFORE=$before; BLOCK_N_BEFORE=$n_before
   BLOCK_ID=$id; BLOCK_T0=$t_cut; BLOCK_SKIPPED=$skipped
@@ -307,6 +323,8 @@ do_latch() {
   printf '__latched__ %s\n' "$cap"
   case "$direction" in
     out) printf '%s cannot send (%s addresses, %sms) - its traffic still arrives\n' "$label" "$((n4 + n6))" "$ms" ;;
+    delay) printf '%s is sending %sms late (%s addresses, %sms) - it still sees everything live\n' \
+             "$label" "$NETCUT_DELAY_MS" "$((n4 + n6))" "$ms" ;;
     in)  printf '%s cannot receive (%s addresses, %sms) - its own packets still leave\n' "$label" "$((n4 + n6))" "$ms" ;;
     *)   printf '%s is cut off (%s addresses, %sms)\n' "$label" "$((n4 + n6))" "$ms" ;;
   esac
@@ -414,6 +432,7 @@ serve() {
   rm -f "$NETCUT_RUN_DIR"/reply.*      # nobody is still waiting on those
   # The client reads this to tell an up-to-date helper from an older one
   # instead of waiting out a timeout on a verb the helper does not know.
+  NETCUT_DELAY_MS_DEFAULT=$NETCUT_DELAY_MS
   printf '%s\n' "$NETCUT_PROTOCOL" > "$NETCUT_RUN_DIR/protocol"
   chmod 644 "$NETCUT_RUN_DIR/protocol"
   restore "daemon start"          # never inherit a block across a restart
@@ -427,7 +446,7 @@ serve() {
   # instead of seeing EOF.
   exec 3<> "$NETCUT_FIFO"
 
-  local line verb a1 a2 a3 id reply fails=0 dir
+  local line verb a1 a2 a3 id reply fails=0 dir dms
   while :; do
     if ! read -r line <&3; then
       fails=$((fails + 1))
@@ -436,7 +455,8 @@ serve() {
     fi
     fails=0
     if [ -n "$line" ]; then
-      verb=''; a1=''; a2=''; a3=''; id=''; dir=both
+      verb=''; a1=''; a2=''; a3=''; id=''; dir=both; dms=''
+      NETCUT_DELAY_MS=${NETCUT_DELAY_MS_DEFAULT:-3000}
       # Pipe-delimited so that an empty field stays a field and an app path may
       # contain spaces. Whitespace splitting silently shifted the request id
       # into another field whenever an argument was empty.
@@ -448,17 +468,21 @@ serve() {
       # so that nothing here can be swapped for a symlink. So the daemon
       # sweeps what the last requests left behind.
       find "$NETCUT_RUN_DIR" -name 'reply.*' -mmin +5 -delete 2>/dev/null
-      # mode may arrive as "drop" or "drop:out"
+      # mode may arrive as "drop", "drop:out", or "drop:delay:2500"
       dir=both
       case "$a3" in
-        *:*) dir=${a3#*:}; a3=${a3%%:*} ;;
+        *:*:*) dms=${a3##*:}; dir=${a3#*:}; dir=${dir%%:*}; a3=${a3%%:*}
+               printf '%s' "$dms" | grep -qE '^[0-9]+$' \
+                 && [ "$dms" -ge 100 ] && [ "$dms" -le 30000 ] \
+                 && NETCUT_DELAY_MS=$dms ;;
+        *:*)   dir=${a3#*:}; a3=${a3%%:*} ;;
       esac
       reply="$NETCUT_RUN_DIR/reply.${id:-nil}"
       case "$verb" in
         cut)     { do_cut     "$a1" "${a2:-asap}" "${a3:-return}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
         app)     { do_cut_app "$a1" "${a2:-asap}" "${a3:-return}" "$dir"; printf '__done__\n'; } > "$reply" 2>&1 ;;
         latch|toggle)
-          say "$verb request target='$a1' window='${a2:-default}' mode='${a3:-drop}' dir='$dir'"
+          say "$verb request target='$a1' window='${a2:-default}' mode='${a3:-drop}' dir='$dir'${dms:+ delay=${dms}ms}"
           if [ "$verb" = latch ]; then
             { do_latch "$a1" "${a3:-drop}" "$a2" "$dir"; printf '__done__\n'; } > "$reply" 2>&1
           else
@@ -481,9 +505,11 @@ serve() {
 rulecheck() {
   local mode direction b out4 in4 out6 in6 rules bad=0 out rc
   for mode in drop return; do
-    for direction in both out in; do
+    for direction in both out in delay; do
       b="block $mode"; out4=''; in4=''; out6=''; in6=''
       case "$direction" in
+        delay) out4="dummynet out quick inet from any to <netcut4> pipe $NETCUT_PIPE"
+               out6="dummynet out quick inet6 from any to <netcut6> pipe $NETCUT_PIPE" ;;
         out)  out4="$b out quick inet from any to <netcut4>"
               out6="$b out quick inet6 from any to <netcut6>" ;;
         in)   in4="$b in quick inet from <netcut4> to any"

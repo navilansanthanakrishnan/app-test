@@ -16,12 +16,21 @@ NETCUT_MAX_SECONDS=${NETCUT_MAX_SECONDS:-120}
 # 4 = the latch reply carries its auto-reenable window in seconds.
 # 5 = the caller may ask for that window.
 # 6 = the mode field may carry a direction, as mode:direction.
+# 7 = direction may be "delay", served by a dummynet pipe rather than a block.
 # netcutd publishes the version it speaks in $NETCUT_RUN_DIR/protocol so the
 # client can tell an old installed helper from a current one without waiting
 # out a timeout on a verb that helper answers with silence.
-NETCUT_PROTOCOL=${NETCUT_PROTOCOL:-6}
+NETCUT_PROTOCOL=${NETCUT_PROTOCOL:-7}
 NETCUT_LATCH_CAP=${NETCUT_LATCH_CAP:-20}     # default auto-reenable, seconds
 NETCUT_LATCH_MIN=${NETCUT_LATCH_MIN:-2}      # a request below this is clamped up
+# direction=delay holds outbound packets in a dummynet pipe instead of
+# dropping them. The link stays alive -- the peer keeps sending, because its
+# acks do eventually arrive -- while everything we send lands late.
+NETCUT_DELAY_MS=${NETCUT_DELAY_MS:-3000}
+NETCUT_PIPE=${NETCUT_PIPE:-57}               # dummynet pipe number we own
+# Slots must hold delay x packet-rate or the pipe tail-drops and the link
+# dies anyway: 3s at 60pps is 180 packets, and the default is 50.
+NETCUT_PIPE_SLOTS=${NETCUT_PIPE_SLOTS:-800}
 # The chosen value lives in the user's config so the menu, the CLI and the
 # daemon all read one number; the daemon clamps whatever it is handed.
 NETCUT_SECONDS_FILE=${NETCUT_SECONDS_FILE:-.config/netcut/seconds}
