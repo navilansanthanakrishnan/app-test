@@ -33,10 +33,16 @@ and nothing else — no Homebrew, no Python, no dependencies.
 
 Press **⌘9**. That's the whole thing.
 
+**Scope it to one app.** Pin an app under Target and the key only fires while
+that app is frontmost — ⌘9 behaves normally in every other app, and you can
+use a key with no modifier at all. While something is actually cut the key
+stays live everywhere, so you can always reconnect from wherever you are.
+
 | | |
 |---|---|
 | ⌘9 | cut the app you are in; press again to reconnect |
 | after 20s | it reconnects on its own |
+| click the dot → Key | three choices, and a bare key needs an app pinned |
 | click the dot → Reconnect after | 5, 10, 15, 20, 30, 60 seconds, or Custom… |
 | the countdown | shows the app and the seconds left; gone when it hits zero |
 | the menu-bar dot | blue = down, grey = connected, red = something failed |
@@ -52,6 +58,7 @@ From a terminal, if you prefer:
 ```sh
 netcut toggle            # same as ⌘9
 netcut pin Discord       # attach ⌘9 to one app so it stops following focus
+netcut key grave         # fire on backtick instead: cmd9 | q | grave
 netcut seconds 18        # auto-reconnect window, 2-120s (menu sets it too)
 netcut pin off           # back to following focus
 netcut app Slack 3       # cut for 3 seconds, then restore by itself
@@ -59,6 +66,18 @@ netcut probe Spotify     # dry run: what it would block, changes nothing
 netcut status            # is anything cut right now
 netcut restore           # clear any block
 ```
+
+### Why a bare key is safe here
+
+A global hot key normally takes that key away from every app. This one is
+registered and unregistered as you switch apps: with an app pinned it only
+exists while that app is frontmost, so Q and backtick stay ordinary keys
+everywhere else. With nothing pinned there is no app to scope them to, so a
+bare key is simply not registered, and the menu says so.
+
+The exception is while an app is cut: the key stays live until it reconnects
+(at most your configured window) so a second press always works, wherever you
+are.
 
 ## Please don't point this at a multiplayer game
 

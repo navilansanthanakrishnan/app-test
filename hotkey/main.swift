@@ -130,6 +130,53 @@ enum NetcutClient {
     }
 }
 
+/// Which key fires a cut. A bare key (no modifier) is only ever registered
+/// while the pinned app is frontmost — on its own it would swallow that
+/// letter everywhere on the system.
+enum KeyBinding: String, CaseIterable {
+    case cmd9, q, grave
+
+    var keyCode: UInt32 {
+        switch self {
+        case .cmd9:  return UInt32(kVK_ANSI_9)
+        case .q:     return UInt32(kVK_ANSI_Q)
+        case .grave: return UInt32(kVK_ANSI_Grave)
+        }
+    }
+    var modifiers: UInt32 { self == .cmd9 ? UInt32(cmdKey) : 0 }
+    var isBare: Bool { modifiers == 0 }
+    var label: String {
+        switch self {
+        case .cmd9:  return "⌘9"
+        case .q:     return "Q"
+        case .grave: return "`"
+        }
+    }
+    var menuLabel: String {
+        switch self {
+        case .cmd9:  return "⌘9"
+        case .q:     return "Q  (on its own)"
+        case .grave: return "`  backtick  (on its own)"
+        }
+    }
+
+    static var path: String { "\(home)/.config/netcut/key" }
+
+    static func load() -> KeyBinding {
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let k = KeyBinding(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return .cmd9 }
+        return k
+    }
+
+    func save() {
+        let url = URL(fileURLWithPath: KeyBinding.path)
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? (rawValue + "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
 /// How long a cut lasts before it reconnects itself. One number, shared by
 /// the menu, the `netcut seconds` command and the daemon, which clamps it.
 enum AutoReconnect {
@@ -300,6 +347,7 @@ final class Agent: NSObject, NSMenuDelegate {
     private let targetItem = NSMenuItem(title: "Target", action: nil, keyEquivalent: "")
     private let placementItem = NSMenuItem(title: "Countdown", action: nil, keyEquivalent: "")
     private let secondsItem = NSMenuItem(title: "Reconnect after", action: nil, keyEquivalent: "")
+    private let keyItem = NSMenuItem(title: "Key", action: nil, keyEquivalent: "")
 
     private var indicator: Indicator = .connected
     private var target: Target = .frontmost
@@ -317,6 +365,9 @@ final class Agent: NSObject, NSMenuDelegate {
     private let overlay = CountdownOverlay()
     private var placement = Placement.load()
     private var seconds = AutoReconnect.load()
+    private var binding = KeyBinding.load()
+    private var handlerInstalled = false
+    private var armed = false
     private var countdown: Timer?
     private var deadline: Date?
     private var downAppName = ""
@@ -326,10 +377,11 @@ final class Agent: NSObject, NSMenuDelegate {
         target = loadPinnedTarget()
         buildMenu()
         trackFrontmostApp()
-        registerHotKey()
         installSignalHandlers()
+        updateArming()
+        startSettingsWatch()
         render()
-        logLine("started (helper protocol=\(NetcutClient.installedProtocol()), hotkey=\(hotKeyWorks ? "\(hotKeyLabel) registered" : "FAILED"), countdown=\(placement.label))")
+        logLine("started (helper protocol=\(NetcutClient.installedProtocol()), key=\(binding.label), armed=\(armed), countdown=\(placement.label), window=\(seconds)s)")
         NSApplication.shared.run()
     }
 
@@ -343,6 +395,7 @@ final class Agent: NSObject, NSMenuDelegate {
         targetItem.submenu = NSMenu()
         placementItem.submenu = NSMenu()
         secondsItem.submenu = NSMenu()
+        keyItem.submenu = NSMenu()
 
         let restore = NSMenuItem(title: "Restore Network Now", action: #selector(restoreNow), keyEquivalent: "")
         restore.target = self
@@ -355,6 +408,7 @@ final class Agent: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(cutItem)
         menu.addItem(targetItem)
+        menu.addItem(keyItem)
         menu.addItem(secondsItem)
         menu.addItem(placementItem)
         menu.addItem(.separator())
@@ -369,13 +423,15 @@ final class Agent: NSObject, NSMenuDelegate {
         target = loadPinnedTarget()
         statusLine.title = menuHeadline
         if case .down(let name) = indicator {
-            cutItem.title = "Reconnect \(name)  (\(hotKeyLabel))"
+            cutItem.title = "Reconnect \(name)  (\(binding.label))"
         } else {
-            cutItem.title = "Cut \(target.describedTarget)  (\(hotKeyLabel))"
+            cutItem.title = "Cut \(target.describedTarget)  (\(binding.label))"
         }
         cutItem.isEnabled = !cutInFlight
         rebuildTargetMenu()
         seconds = AutoReconnect.load()      // the CLI may have changed it
+        if KeyBinding.load() != binding { changeBinding(to: KeyBinding.load()) }
+        rebuildKeyMenu()
         rebuildSecondsMenu()
         rebuildPlacementMenu()
     }
@@ -385,7 +441,13 @@ final class Agent: NSObject, NSMenuDelegate {
         case .down(let name): return "\(name) is CUT OFF — \(hotKeyLabel) reconnects it"
         case .failed(let why): return "Last: \(why)"
         case .connected:
-            if !hotKeyWorks { return "\(hotKeyLabel) is NOT registered — see the log" }
+            if !hotKeyWorks { return "\(binding.label) is NOT registered — see the log" }
+            if !armed {
+                if case .pinned(_, let name) = target {
+                    return "\(binding.label) fires only in \(name) — not in front right now"
+                }
+                return "\(binding.label) on its own needs an app pinned in Target"
+            }
             return "Connected. \(lastResult)"
         }
     }
@@ -433,6 +495,40 @@ final class Agent: NSObject, NSMenuDelegate {
     }
 
 
+
+    private func rebuildKeyMenu() {
+        guard let sub = keyItem.submenu else { return }
+        sub.removeAllItems()
+        keyItem.title = "Key: \(binding.label)"
+        for option in KeyBinding.allCases {
+            let item = NSMenuItem(title: option.menuLabel, action: #selector(pickKey(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = option.rawValue
+            item.state = option == binding ? .on : .off
+            sub.addItem(item)
+        }
+        sub.addItem(.separator())
+        let note = NSMenuItem(title: "A key on its own needs an app pinned above",
+                              action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        sub.addItem(note)
+    }
+
+    @objc private func pickKey(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let option = KeyBinding(rawValue: raw) else { return }
+        changeBinding(to: option)
+    }
+
+    private func changeBinding(to option: KeyBinding) {
+        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
+        armed = false
+        binding = option
+        option.save()
+        logLine("key set to \(option.label)")
+        updateArming()
+        render()
+    }
 
     private func rebuildSecondsMenu() {
         guard let sub = secondsItem.submenu else { return }
@@ -512,6 +608,7 @@ final class Agent: NSObject, NSMenuDelegate {
     @objc private func pickFrontmost() {
         target = .frontmost
         savePinnedTarget(target)
+        updateArming()
         render()
     }
 
@@ -519,6 +616,7 @@ final class Agent: NSObject, NSMenuDelegate {
         guard let path = sender.representedObject as? String else { return }
         target = .pinned(bundlePath: path, name: sender.title)
         savePinnedTarget(target)
+        updateArming()
         render()
     }
 
@@ -542,7 +640,10 @@ final class Agent: NSObject, NSMenuDelegate {
         ) { [weak self] note in
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   app.processIdentifier != getpid() else { return }
-            MainActor.assumeIsolated { self?.lastFrontmost = app }
+            MainActor.assumeIsolated {
+                self?.lastFrontmost = app
+                self?.updateArming()
+            }
         }
     }
 
@@ -555,22 +656,64 @@ final class Agent: NSObject, NSMenuDelegate {
 
     // MARK: the hotkey
 
-    private func registerHotKey() {
+    /// The Carbon handler is installed once. The key itself is registered and
+    /// unregistered as the frontmost app changes, which is what keeps it from
+    /// being taken system wide.
+    private func installHotKeyHandler() {
+        guard !handlerInstalled else { return }
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                  eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, _, _ -> OSStatus in
             DispatchQueue.main.async { MainActor.assumeIsolated { sharedAgent?.fire(source: "hotkey") } }
             return noErr
         }, 1, &spec, nil, nil)
+        handlerInstalled = true
+    }
 
-        let id = EventHotKeyID(signature: OSType(0x4E435554), id: 1)   // 'NCUT'
-        let status = RegisterEventHotKey(UInt32(kVK_ANSI_9), UInt32(cmdKey), id,
-                                        GetApplicationEventTarget(), 0, &hotKeyRef)
-        hotKeyWorks = status == noErr
-        if !hotKeyWorks {
-            logLine("RegisterEventHotKey(\(hotKeyLabel)) failed with OSStatus \(status) — another app may already own it")
-            indicator = .failed("\(hotKeyLabel) unavailable (OSStatus \(status))")
+    /// Should the key be live right now?
+    ///
+    /// - While an app is cut: always. A second press has to be able to
+    ///   reconnect it whatever he has switched to in the meantime.
+    /// - With an app pinned: only while that app is frontmost. This is what
+    ///   gives ⌘9 back to Chrome, and what makes a bare key safe at all.
+    /// - With nothing pinned: a key with a modifier is always live; a bare
+    ///   key never is, because there is no app to scope it to.
+    private func shouldBeArmed() -> Bool {
+        if case .down = indicator { return true }
+        switch target {
+        case .frontmost:
+            return !binding.isBare
+        case .pinned(let path, let name):
+            guard let front = currentFrontmostApp() else { return false }
+            if let frontPath = front.bundleURL?.path, frontPath == path { return true }
+            // A pin may be a bare app name or a .exe rather than a bundle path.
+            return (front.localizedName ?? "").caseInsensitiveCompare(name) == .orderedSame
         }
+    }
+
+    func updateArming() {
+        installHotKeyHandler()
+        let want = shouldBeArmed()
+        guard want != armed else { return }
+        if want {
+            let id = EventHotKeyID(signature: OSType(0x4E435554), id: 1)   // 'NCUT'
+            let status = RegisterEventHotKey(binding.keyCode, binding.modifiers, id,
+                                            GetApplicationEventTarget(), 0, &hotKeyRef)
+            armed = status == noErr
+            hotKeyWorks = armed
+            if armed {
+                logLine("\(binding.label) armed")
+            } else {
+                logLine("RegisterEventHotKey(\(binding.label)) failed with OSStatus \(status) — another app may own it")
+                indicator = .failed("\(binding.label) unavailable (OSStatus \(status))")
+            }
+        } else {
+            if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
+            armed = false
+            hotKeyWorks = true            // not broken, just not listening here
+            logLine("\(binding.label) released")
+        }
+        render()
     }
 
     // MARK: signals
@@ -630,6 +773,23 @@ final class Agent: NSObject, NSMenuDelegate {
     /// is still up. netcutd lifts a forgotten latch on its own cap, and a dot
     /// still showing blue over a working network would be the one failure
     /// that matters here.
+    /// The CLI writes the same settings files the menu does, so re-read them
+    /// on a slow timer. Without this a `netcut pin` or `netcut key` would not
+    /// take hold until the next app switch.
+    private func startSettingsWatch() {
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let pinned = loadPinnedTarget()
+                let key = KeyBinding.load()
+                self.seconds = AutoReconnect.load()
+                if key != self.binding { self.changeBinding(to: key); return }
+                if pinned != self.target { self.target = pinned; self.updateArming(); self.render() }
+                else { self.updateArming() }
+            }
+        }
+    }
+
     private func startStatusPolling() {
         statusPoll?.invalidate()
         statusPoll = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -748,6 +908,7 @@ final class Agent: NSObject, NSMenuDelegate {
     }
 
     func networkIs(down: Bool, name: String? = nil, seconds: Int? = nil) {
+        defer { updateArming() }      // a live cut keeps the key available everywhere
         revertWork?.cancel()
         if down {
             let who = name ?? lastTargetName
@@ -855,10 +1016,18 @@ final class Agent: NSObject, NSMenuDelegate {
         switch indicator {
         case .connected:
             glyph = "●"
-            color = hotKeyWorks ? .tertiaryLabelColor : .systemOrange
-            tooltip = hotKeyWorks
-                ? "netcut — connected. \(hotKeyLabel) cuts \(target.describedTarget) for \(seconds)s"
-                : "netcut — \(hotKeyLabel) could not be registered"
+            // Dimmer still when the key is deliberately not listening, so
+            // "nothing happened" is visibly a state and not a failure.
+            color = hotKeyWorks ? (armed ? .tertiaryLabelColor : .quaternaryLabelColor) : .systemOrange
+            if !hotKeyWorks {
+                tooltip = "netcut — \(binding.label) could not be registered"
+            } else if armed {
+                tooltip = "netcut — connected. \(binding.label) cuts \(target.describedTarget) for \(seconds)s"
+            } else if case .pinned(_, let name) = target {
+                tooltip = "netcut — waiting for \(name); \(binding.label) does nothing elsewhere"
+            } else {
+                tooltip = "netcut — \(binding.label) on its own needs an app pinned"
+            }
         case .down(let name):
             glyph = "●"
             color = .systemBlue

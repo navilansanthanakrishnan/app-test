@@ -6,6 +6,7 @@
 #   netcut front             blip: cut whatever is in front, straight back
 #   netcut app Discord       blip a named application (or a full .app path)
 #   netcut pin Discord       attach ⌘9 to that app; it stops following focus
+#   netcut key grave         fire on ` instead of ⌘9 (cmd9 | q | grave)
 #   netcut seconds 18        auto-reconnect after 18s instead of 20
 #   netcut seconds           print the current window
 #   netcut pin off           back to "whatever is in front"
@@ -85,6 +86,31 @@ running_apps() {
 # means follow focus.
 NETCUT_PIN=${NETCUT_PIN:-$HOME/.config/netcut/target}
 NETCUT_SECONDS=${NETCUT_SECONDS:-$HOME/.config/netcut/seconds}
+NETCUT_KEY=${NETCUT_KEY:-$HOME/.config/netcut/key}
+
+key_show() {
+  local k
+  k=$(cat "$NETCUT_KEY" 2>/dev/null | tr -dc 'a-z0-9')
+  case "${k:-cmd9}" in
+    cmd9)  printf 'the key is ⌘9\n' ;;
+    q)     printf 'the key is Q, which only fires while the pinned app is in front\n' ;;
+    grave) printf 'the key is ` (backtick), which only fires while the pinned app is in front\n' ;;
+  esac
+}
+
+key_set() {
+  case "$1" in
+    cmd9|q|grave) ;;
+    *) die "key must be cmd9, q or grave" ;;
+  esac
+  mkdir -p "$(dirname "$NETCUT_KEY")" || die "could not write $NETCUT_KEY"
+  printf '%s\n' "$1" > "$NETCUT_KEY" || die "could not write $NETCUT_KEY"
+  key_show
+  case "$1" in
+    q|grave) [ -s "$NETCUT_PIN" ] && [ "$(cat "$NETCUT_PIN")" != frontmost ] \
+      || printf 'note: a bare key does nothing until an app is pinned (netcut pin <app>)\n' ;;
+  esac
+}
 
 seconds_get() {
   local n
@@ -168,13 +194,19 @@ request() {
 
 case "${1:-}" in
   ''|-h|--help|help)
-    sed -n '2,24p' "$0" | sed 's/^#\{1,\} \{0,1\}//'
+    sed -n '2,25p' "$0" | sed 's/^#\{1,\} \{0,1\}//'
     printf 'profiles: %s\n' "$(profiles)"
     ;;
   status)  request status ;;
   restore) request restore ;;
   apps)    p=$(profiles); [ -n "$p" ] && printf '%s\n' $p || die "no profiles installed" ;;
   running) running_apps | sed 's#.*/##; s/\.app$//' ;;
+  key)
+    case "${2:-}" in
+      '') key_show ;;
+      *)  key_set "$2" ;;
+    esac
+    ;;
   seconds)
     case "${2:-}" in
       '') printf 'a cut reconnects itself after %ss\n' "$(seconds_get)" ;;
