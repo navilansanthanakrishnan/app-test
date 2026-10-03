@@ -98,6 +98,7 @@ sudo install -d -o root -g wheel -m 755 /usr/local/libexec/netcut \
 sudo install -o root -g wheel -m 755 "$SRC/netcutd"        /usr/local/libexec/netcut/netcutd
 sudo install -o root -g wheel -m 644 "$SRC/lib/common.sh"  /usr/local/libexec/netcut/lib/common.sh
 sudo install -o root -g wheel -m 644 "$SRC"/profiles/*.conf /usr/local/libexec/netcut/profiles/
+sudo install -o root -g wheel -m 644 "$SRC/exclusions.txt"   /usr/local/libexec/netcut/exclusions.txt
 sudo install -o root -g wheel -m 644 "$TMP_PLIST" "/Library/LaunchDaemons/$HELPER_LABEL.plist"
 rm -f "$TMP_PLIST"
 
@@ -146,5 +147,6 @@ Done.
 
   netcut toggle            the same from a terminal
   ./uninstall.sh           removes all of it
+  lab/netcut-lab           fault injection for a service you run
 
 DONE

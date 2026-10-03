@@ -71,6 +71,7 @@ netcut pin off           # back to following focus
 netcut app Slack 3       # cut for 3 seconds, then restore by itself
 netcut probe Spotify     # dry run: what it would block, changes nothing
 netcut diag Spotify      # measure what a one-way cut really does to it
+netcut status            # ...also lists how many exclusions are loaded
 netcut status            # is anything cut right now
 netcut restore           # clear any block
 ```
@@ -131,6 +132,60 @@ unconditionally. If yours acknowledges, a hard block is the wrong instrument:
 use one-way *loss* or *delay* (macOS ships `dnctl` for this) so the connection
 degrades instead of stalling, or suppress the payload at the application layer
 and let the heartbeats through.
+
+## lab/netcut-lab — when a firewall is the wrong instrument
+
+A firewall blocks an **address**. That is all it can do, and it means your
+acknowledgements die alongside whatever you were trying to stop — so the far
+end stops hearing from you, stops sending, and a one-way block collapses into
+a two-way one. Measured, in this repo's own diagnostic: outbound 175.5 KB/s →
+2.7 KB/s as instructed, inbound 30.9 KB/s → **0 B/s with no inbound rule
+loaded at all**.
+
+For a service you run, `lab/netcut-lab` sits between your client and your
+server and decides per packet:
+
+```sh
+netcut-lab --listen 127.0.0.1:30000 --upstream 10.0.0.5:5000
+# point your client at 127.0.0.1:30000, then from another shell:
+netcut-lab ctl hold 5          # 5s: hold state updates, keep keepalives alive
+netcut-lab ctl hold 5 --all    # ...drop everything outbound instead
+netcut-lab ctl drop-in 5       # the mirror
+netcut-lab ctl loss 30 10      # 30% outbound loss for 10s
+netcut-lab ctl release ; netcut-lab ctl stats
+```
+
+`hold` keeps packets at or below `--keepalive-max` (64 bytes by default)
+flowing while dropping the rest, because in most realtime protocols the acks
+and heartbeats are the small ones. That keeps the session **up** while the
+state updates stop arriving — which is the whole thing a firewall cannot do.
+Measured against a stand-in server:
+
+```
+normal            server got: state= 38 keepalive= 38   client received= 38
+during hold       server got: state=  0 keepalive= 38   client received= 38
+after release     server got: state= 38 keepalive= 38   client received= 38
+```
+
+UDP, protocol-agnostic, no privileges. It is the right tool for testing what
+your server does with a client that has gone quiet but has not gone away —
+including whether your own anti-cheat notices.
+
+## Exclusions
+
+`exclusions.txt` is installed next to the privileged helper and read before
+any rule is written. A target matching an entry is refused outright, on every
+path, with no way to override it from the client side:
+
+```
+$ netcut app Roblox
+error: Roblox is on the exclusion list (matched "roblox")
+```
+
+It ships with the commercial multiplayer clients in it. The file is root
+owned, so changing it is a deliberate privileged edit followed by a
+reinstall — which is the point. Testing your own service is what this is for;
+those are not your own service.
 
 ## Not for public game servers. Not for inexperienced users.
 

@@ -1,0 +1,40 @@
+# Applications netcut will refuse to touch.
+#
+# One pattern per line, matched case-insensitively against the target's name
+# with punctuation and spaces removed, so "Roblox", "roblox" and
+# "/Applications/Roblox.app" all match the entry "roblox".
+#
+# This file is installed to /usr/local/libexec/netcut/exclusions.txt and read
+# by the privileged helper, which is root-owned: editing it is a deliberate,
+# privileged act followed by a reinstall, not an accident at 2am.
+#
+# What belongs here: commercial multiplayer clients, where cutting a session
+# takes something from the other people in it and risks the account. Testing
+# your own service is what this tool is for; these are not your own service.
+#
+# For a service you run, use lab/netcut-lab instead -- it drops the messages
+# you choose and keeps the connection alive underneath, which a firewall
+# cannot do.
+
+roblox
+robloxplayer
+robloxstudio
+fortnite
+valorant
+riotclient
+leagueclient
+overwatch
+counterstrike
+cs2
+apex
+r5apex
+callofduty
+modernwarfare
+dota2
+rocketleague
+minecraft
+rust
+gta
+fivem
+pubg
+destiny2

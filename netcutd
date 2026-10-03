@@ -253,6 +253,19 @@ cut_core() {
   fi
 }
 
+# refuse_if_excluded <bundle> -- the enforced half of the scope note
+refuse_if_excluded() {
+  local hit
+  hit=$(excluded "$1") || return 0
+  say "refused (excluded): $1 matched '$hit'"
+  printf 'error: %s is on the exclusion list (matched "%s")\n' "$(app_label "$1")" "$hit"
+  printf '       netcut will not touch a commercial multiplayer client. For a\n'
+  printf '       service you run, use lab/netcut-lab, which drops the messages\n'
+  printf '       you choose and keeps the connection alive underneath.\n'
+  printf '       The list is /usr/local/libexec/netcut/exclusions.txt\n'
+  return 1
+}
+
 # do_latch <app spec> <mode>
 # Cuts and stays cut. Returns the moment the block is up — no hold, no
 # measuring — because the second ⌘9 press is what ends it.
@@ -276,6 +289,7 @@ do_latch() {
   bundle=$(resolve_app_spec "$spec") || { say "refused: unresolvable app '$spec'"
     printf 'error: no application matches %s\n' "$spec"; return 1; }
   label=$(app_label "$bundle")
+  refuse_if_excluded "$bundle" || return 1
   apply_block "$label" "$(proc_match_for "$bundle")" '' '' "$mode" latch "$direction" || return 1
 
   # A latch nobody releases still lifts, so a forgotten press cannot strand an
@@ -342,6 +356,7 @@ do_cut_app() {
     printf '       give a full path to a .app bundle or .exe, or an installed app name\n'
     return 1; }
   label=$(app_label "$bundle")
+  refuse_if_excluded "$bundle" || return 1
   cut_core "$label" "$(proc_match_for "$bundle")" '' '' "$hold" "$mode" "$direction"
 }
 
@@ -354,6 +369,7 @@ probe() {
   label=$(app_label "$bundle")
   printf 'target:  %s\n' "$label"
   printf 'bundle:  %s\n' "$bundle"
+  refuse_if_excluded "$bundle" || return 1
   pids=$(app_pids "$(proc_match_for "$bundle")")
   printf 'match:   %s\n' "$(proc_match_for "$bundle")"
   printf 'pids:    %s\n' "${pids:-none (not running)}"
@@ -384,7 +400,10 @@ status() {
   printf 'anchor %s: %s rule(s) loaded\n' "$NETCUT_ANCHOR" \
     "$(pfctl -a "$NETCUT_ANCHOR" -s rules 2>/dev/null | grep -c . | tr -d ' ')"
   printf 'profiles: %s\n' "$(ls "$NETCUT_PROFILE_DIR" 2>/dev/null | sed 's/\.conf$//' | tr '\n' ' ')"
-  printf 'app targets: any running application (protocol %s)\n' "$NETCUT_PROTOCOL"
+  printf 'app targets: any running application except the exclusion list\n'
+  printf 'exclusions:  %s entr(y/ies) in %s\n' \
+    "$(grep -cv '^[[:space:]]*\(#\|$\)' "$NETCUT_EXCLUSIONS" 2>/dev/null || echo 0)" "$NETCUT_EXCLUSIONS"
+  printf 'protocol:    %s\n' "$NETCUT_PROTOCOL"
 }
 
 serve() {

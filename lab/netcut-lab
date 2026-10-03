@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""netcut-lab - a fault-injection relay for a service you run.
+
+Sits between your client and your server and decides, per packet, what gets
+through. That is the difference between this and the firewall half of this
+repo: pf blocks an address, so your acknowledgements die with your state
+updates and the far end stops talking to you. Here you can drop exactly the
+messages you want and keep the connection alive underneath them.
+
+The case it was built for: validating a lag-switch detector. Hold the
+client's state updates while its heartbeats keep flowing, watch whether the
+server notices, release, and see what the reconciliation does.
+
+    netcut-lab --listen 127.0.0.1:30000 --upstream 10.0.0.5:5000
+
+Point your client at the listen address. Then, from another shell:
+
+    netcut-lab ctl hold 5          # 5s: drop client->server, keep acks
+    netcut-lab ctl hold 5 --all    # ...including the small packets
+    netcut-lab ctl drop-in 5       # the mirror: drop server->client
+    netcut-lab ctl loss 30 10      # 30% loss outbound for 10s
+    netcut-lab ctl release         # stop whatever is running
+    netcut-lab ctl stats
+
+UDP only: that is what realtime game traffic is. It forwards blind, so it
+needs no knowledge of your protocol beyond "small packets are probably
+keepalives", which --keepalive-max lets you set.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import signal
+import socket
+import sys
+import threading
+import time
+
+STATE_DIR = os.path.expanduser("~/.netcut-lab")
+CTL_PATH = os.path.join(STATE_DIR, "control.sock")
+
+
+class Rules:
+    """What to do with a packet right now. Mutated by the control socket."""
+
+    def __init__(self, keepalive_max: int):
+        self.lock = threading.Lock()
+        self.keepalive_max = keepalive_max
+        self.until = 0.0
+        self.mode = "pass"          # pass | hold | hold-all | drop-in | loss
+        self.loss_pct = 0
+        self.stats = {
+            "out_forwarded": 0, "out_dropped": 0,
+            "in_forwarded": 0, "in_dropped": 0,
+            "episodes": 0,
+        }
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            left = max(0.0, self.until - time.monotonic())
+            return {"mode": self.mode if left else "pass",
+                    "seconds_left": round(left, 1),
+                    "keepalive_max": self.keepalive_max,
+                    **self.stats}
+
+    def arm(self, mode: str, seconds: float, loss_pct: int = 0) -> None:
+        with self.lock:
+            self.mode = mode
+            self.loss_pct = loss_pct
+            self.until = time.monotonic() + seconds
+            self.stats["episodes"] += 1
+
+    def release(self) -> None:
+        with self.lock:
+            self.mode = "pass"
+            self.until = 0.0
+
+    def _active(self) -> str:
+        if time.monotonic() >= self.until:
+            return "pass"
+        return self.mode
+
+    def allow_outbound(self, size: int) -> bool:
+        with self.lock:
+            mode = self._active()
+            if mode == "hold":
+                # Keep the small packets flowing. In most realtime protocols
+                # the acks and heartbeats are the small ones, and keeping
+                # them is the whole point: the session stays up while the
+                # state updates stop arriving.
+                return size <= self.keepalive_max
+            if mode == "hold-all":
+                return False
+            if mode == "loss":
+                return random.randint(1, 100) > self.loss_pct
+            return True
+
+    def allow_inbound(self, size: int) -> bool:
+        with self.lock:
+            return self._active() != "drop-in"
+
+    def count(self, direction: str, allowed: bool) -> None:
+        with self.lock:
+            self.stats[f"{direction}_{'forwarded' if allowed else 'dropped'}"] += 1
+
+
+def relay(listen: tuple[str, int], upstream: tuple[str, int], rules: Rules) -> None:
+    """One UDP socket facing the client, one per client facing the server."""
+    down = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    down.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    down.bind(listen)
+    print(f"listening on {listen[0]}:{listen[1]} -> {upstream[0]}:{upstream[1]}", flush=True)
+
+    peers: dict[tuple, socket.socket] = {}
+
+    def pump_up(client: tuple, sock: socket.socket) -> None:
+        """Server -> client."""
+        while True:
+            try:
+                data, _ = sock.recvfrom(65535)
+            except OSError:
+                return
+            ok = rules.allow_inbound(len(data))
+            rules.count("in", ok)
+            if ok:
+                down.sendto(data, client)
+
+    while True:
+        data, client = down.recvfrom(65535)
+        sock = peers.get(client)
+        if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.connect(upstream)
+            peers[client] = sock
+            threading.Thread(target=pump_up, args=(client, sock), daemon=True).start()
+            print(f"client {client[0]}:{client[1]} attached", flush=True)
+        ok = rules.allow_outbound(len(data))
+        rules.count("out", ok)
+        if ok:
+            try:
+                sock.send(data)
+            except OSError:
+                pass
+
+
+def serve_control(rules: Rules) -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if os.path.exists(CTL_PATH):
+        os.unlink(CTL_PATH)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(CTL_PATH)
+    os.chmod(CTL_PATH, 0o600)
+    srv.listen(8)
+    while True:
+        conn, _ = srv.accept()
+        try:
+            req = json.loads(conn.recv(4096).decode() or "{}")
+            cmd = req.get("cmd")
+            if cmd == "hold":
+                rules.arm("hold-all" if req.get("all") else "hold", float(req["seconds"]))
+                reply = rules.snapshot()
+            elif cmd == "drop-in":
+                rules.arm("drop-in", float(req["seconds"]))
+                reply = rules.snapshot()
+            elif cmd == "loss":
+                rules.arm("loss", float(req["seconds"]), int(req["pct"]))
+                reply = rules.snapshot()
+            elif cmd == "release":
+                rules.release()
+                reply = rules.snapshot()
+            else:
+                reply = rules.snapshot()
+            conn.sendall(json.dumps(reply).encode())
+        except Exception as exc:                      # noqa: BLE001
+            try:
+                conn.sendall(json.dumps({"error": str(exc)}).encode())
+            except OSError:
+                pass
+        finally:
+            conn.close()
+
+
+def send_control(payload: dict) -> int:
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(CTL_PATH)
+    except OSError:
+        print("no relay is running (start one with: netcut-lab --listen ... --upstream ...)",
+              file=sys.stderr)
+        return 1
+    sock.sendall(json.dumps(payload).encode())
+    print(json.dumps(json.loads(sock.recv(8192).decode()), indent=2))
+    sock.close()
+    return 0
+
+
+def hostport(text: str) -> tuple[str, int]:
+    host, _, port = text.rpartition(":")
+    if not host or not port.isdigit():
+        raise argparse.ArgumentTypeError("expected host:port")
+    return host, int(port)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="sub")
+
+    ctl = sub.add_parser("ctl", help="talk to a running relay")
+    ctl.add_argument("action", choices=["hold", "drop-in", "loss", "release", "stats"])
+    ctl.add_argument("args", nargs="*")
+    ctl.add_argument("--all", action="store_true",
+                     help="hold every packet, keepalives included")
+
+    ap.add_argument("--listen", type=hostport, help="local address your client connects to")
+    ap.add_argument("--upstream", type=hostport, help="your server")
+    ap.add_argument("--keepalive-max", type=int, default=64,
+                    help="packets this size or smaller keep flowing during a hold (default 64)")
+    args = ap.parse_args()
+
+    if args.sub == "ctl":
+        if args.action == "hold":
+            secs = float(args.args[0]) if args.args else 5.0
+            return send_control({"cmd": "hold", "seconds": secs, "all": args.all})
+        if args.action == "drop-in":
+            secs = float(args.args[0]) if args.args else 5.0
+            return send_control({"cmd": "drop-in", "seconds": secs})
+        if args.action == "loss":
+            pct = int(args.args[0]) if args.args else 30
+            secs = float(args.args[1]) if len(args.args) > 1 else 10.0
+            return send_control({"cmd": "loss", "pct": pct, "seconds": secs})
+        if args.action == "release":
+            return send_control({"cmd": "release"})
+        return send_control({"cmd": "stats"})
+
+    if not args.listen or not args.upstream:
+        ap.error("--listen and --upstream are both required")
+
+    rules = Rules(args.keepalive_max)
+    threading.Thread(target=serve_control, args=(rules,), daemon=True).start()
+    signal.signal(signal.SIGINT, lambda *_: (print("\nbye"), sys.exit(0)))
+    relay(args.listen, args.upstream, rules)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -9,6 +9,7 @@ NETCUT_LOG=${NETCUT_LOG:-/var/log/netcut.log}
 NETCUT_ANCHOR=${NETCUT_ANCHOR:-com.apple/netcut}
 NETCUT_LIBEXEC=${NETCUT_LIBEXEC:-/usr/local/libexec/netcut}
 NETCUT_PROFILE_DIR=${NETCUT_PROFILE_DIR:-$NETCUT_LIBEXEC/profiles}
+NETCUT_EXCLUSIONS=${NETCUT_EXCLUSIONS:-$NETCUT_LIBEXEC/exclusions.txt}
 NETCUT_MAX_SECONDS=${NETCUT_MAX_SECONDS:-120}
 # Request-protocol version. 1 = whitespace-split, profiles only. 2 = pipe-
 # delimited fields plus the "app" and "probe" verbs. 3 = "latch" and "toggle".
@@ -225,6 +226,28 @@ kill_states() {
     printf '%s\n' $2 | sed 's#/.*##' | xargs -P 24 -I@ pfctl -k ::/0 -k @ >/dev/null 2>&1
   fi
   return 0
+}
+
+# excluded <bundle path or name> -> prints the matched pattern, returns 0 if
+# the target is on the exclusion list.
+#
+# The list is a file installed beside the privileged helper, root-owned, so
+# changing it takes a deliberate edit and a reinstall. Unlike the warning it
+# replaced, this one is enforced in the daemon before any rule is written.
+excluded() {
+  local probe pat
+  [ -f "$NETCUT_EXCLUSIONS" ] || return 1
+  probe=$(printf '%s' "$1" | tr 'A-Z' 'a-z' | sed 's#.*/##; s#\.app$##; s/[^a-z0-9]//g')
+  [ -n "$probe" ] || return 1
+  while read -r pat; do
+    case "$pat" in ''|'#'*) continue ;; esac
+    pat=$(printf '%s' "$pat" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9]//g')
+    [ -n "$pat" ] || continue
+    case "$probe" in
+      *"$pat"*) printf '%s\n' "$pat"; return 0 ;;
+    esac
+  done < "$NETCUT_EXCLUSIONS"
+  return 1
 }
 
 # first_bundle <executable path> -> the outermost .app, or the basename
