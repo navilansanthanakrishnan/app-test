@@ -27,6 +27,11 @@ NETCUT_LATCH_MIN=${NETCUT_LATCH_MIN:-2}      # a request below this is clamped u
 # dropping them. The link stays alive -- the peer keeps sending, because its
 # acks do eventually arrive -- while everything we send lands late.
 NETCUT_DELAY_MS=${NETCUT_DELAY_MS:-3000}
+# Ending a one-way cut with a brief FULL cut. With both directions blocked
+# the client sees the connection die and runs its own reconnect path, which
+# is fast; with only outbound blocked it never notices anything was wrong,
+# so on release it limps back instead. This hands it the clean signal.
+NETCUT_EXIT_BLIP_MS=${NETCUT_EXIT_BLIP_MS:-250}
 NETCUT_PIPE=${NETCUT_PIPE:-57}               # dummynet pipe number we own
 # The queue must hold delay x packet-rate or the pipe tail-drops and the link
 # dies anyway -- 3s at 60pps is ~180 packets. dummynet caps the SLOT form at

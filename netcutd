@@ -38,8 +38,21 @@ since() { printf '%s\n' $(( ( $(now) - $1 ) / 1000000 )); }   # -> milliseconds
 # ---------- pf plumbing ----------
 
 restore() {   # idempotent; safe when nothing is cut
-  local reason=${1:-manual} token=''
+  local reason=${1:-manual} token='' dirn='' blip
   [ -f "$STATE" ] && token=$(sed -n 's/^token=//p' "$STATE")
+  [ -f "$STATE" ] && dirn=$(sed -n 's/^direction=//p' "$STATE")
+
+  # A one-way cut leaves the client believing it is still connected, so it
+  # has no reason to resync quickly. Half a blink of a full cut gives it the
+  # disconnect it recovers from fast -- which is why "both" always felt
+  # instant and "out" did not.
+  blip=${NETCUT_EXIT_BLIP_MS:-0}
+  if [ "$blip" -gt 0 ] && { [ "$dirn" = out ] || [ "$dirn" = in ]; } \
+     && [ -s "$NETCUT_RUN_DIR/exitrules" ]; then
+    if pfctl -a "$NETCUT_ANCHOR" -f "$NETCUT_RUN_DIR/exitrules" >/dev/null 2>&1; then
+      awk -v m="$blip" 'BEGIN{ system("sleep " m/1000) }' </dev/null >/dev/null 2>&1
+    fi
+  fi
   # Pipe FIRST, then the rule. Flushing the rule first lets fresh packets go
   # straight out while the pipe still holds seconds of old ones, so the peer
   # receives a burst of stale positions *after* the current one -- which is
@@ -194,6 +207,12 @@ $in6"
   # A delay is not a disconnect: killing the states would tear down the very
   # flow we are trying to keep alive.
   [ "$direction" = delay ] || kill_states "$v4" "$v6"
+
+  # Stash the both-ways ruleset for the same addresses so restore can flash
+  # a full cut on the way out without re-discovering anything.
+  { [ -n "$v4" ] && printf 'table <netcut4> persist {%s }\nblock drop quick inet from any to <netcut4>\nblock drop quick inet from <netcut4> to any\n' "$v4"
+    [ -n "$v6" ] && printf 'table <netcut6> persist {%s }\nblock drop quick inet6 from any to <netcut6>\nblock drop quick inet6 from <netcut6> to any\n' "$v6"
+  } > "$NETCUT_RUN_DIR/exitrules" 2>/dev/null
 
   BLOCK_V4=$v4; BLOCK_V6=$v6; BLOCK_BEFORE=$before; BLOCK_N_BEFORE=$n_before
   BLOCK_ID=$id; BLOCK_T0=$t_cut; BLOCK_SKIPPED=$skipped
