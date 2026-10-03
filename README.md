@@ -14,6 +14,10 @@ network is down right now, grey means it is connected.**
 For testing how an app behaves when its connection drops — reconnect logic,
 retry backoff, offline states, your own client against your own server.
 
+**Your own.** Not a public game server, and not something someone else is
+also connected to — see [the scope](#not-for-public-game-servers-not-for-inexperienced-users)
+before using it. It assumes an experienced user.
+
 ## Install
 
 ```sh
@@ -128,32 +132,30 @@ use one-way *loss* or *delay* (macOS ships `dnctl` for this) so the connection
 degrades instead of stalling, or suppress the payload at the application layer
 and let the heartbeats through.
 
-## Please don't point this at a multiplayer game
+## Not for public game servers. Not for inexperienced users.
 
-**Especially not in one-way mode.** A cut that leaves you watching a session
-the other players cannot see you in, and then puts you back, is a lag switch
-in the most literal sense — the whole value of the asymmetry is that it is
-one-sided. Everything below applies to the normal mode; it applies more here.
+**Do not use this in Roblox public servers, or in any multiplayer session
+with other people in it.** Not in one-way mode, not in both-ways mode, not
+"just to test". This tool exists for people breaking their *own* services on
+purpose, on machines and servers they own.
 
-This exists because half-open connection handling is a real thing to test
-against a server you run. There is no check stopping you from aiming it
-somewhere else. That is a choice, and this paragraph is what replaced the
-check.
+Why it matters, once, plainly: cutting a client mid-session desyncs it from
+the server, and the cost of that desync is paid by the other players in the
+session — they see you freeze, teleport, or trade hits that already
+happened. They did not opt into your test. Anti-cheat also reads a repeating
+connection drop from one client as exactly what it resembles, and the ban
+lands on the account, not on the tool.
 
-**It will let you. There is no check — that is deliberate, and this is what
-replaced it.**
+**This assumes you know what you are doing.** It loads firewall rules as
+root, blocks by address rather than by process, and will take down anything
+else talking to the same addresses for the length of the cut. If you are not
+comfortable reading `pfctl -a com.apple/netcut -s rules` and reasoning about
+what a dropped packet does to your protocol, this is the wrong tool to be
+pointing at anything.
 
-Cutting a multiplayer client's network mid-match is a **lag switch**. Your
-client keeps simulating while the server stops hearing from you, and the
-desync lands on the other players: they see you teleport, freeze, or trade
-hits that already happened. It isn't a trick played on the game, it's a trick
-played on the people in it.
-
-It's also an account risk. Anti-cheat treats a repeating connection drop from
-one client as exactly what it looks like, and the ban lands on the account.
-
-The case this is for is a client you wrote, against a server you run, with
-nobody else in the session.
+There is no check enforcing any of this. That is deliberate — a tool for
+breaking your own things cannot tell whose things they are — so it is stated
+here instead, which makes it your call and your responsibility.
 
 ## How it works
 
