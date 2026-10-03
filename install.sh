@@ -61,6 +61,10 @@ case ":$PATH:" in
 esac
 
 # ----------------------------------------------------------- privileged half
+step "Checking the firewall rules parse"
+"$SRC/netcutd" rulecheck || {
+  printf 'refusing to install: the generated pf rules do not parse\n' >&2; exit 1; }
+
 step "Installing the privileged helper (this is the password prompt)"
 ME=$(id -un)
 TMP_PLIST=$(mktemp)

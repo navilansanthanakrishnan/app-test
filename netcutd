@@ -219,16 +219,19 @@ GUARD
   # is the case a server's own timeout handling is easiest to get wrong on);
   # "in" is the mirror. pf's `out` matches packets leaving an interface and
   # `in` those arriving, so each case drops one rule of the pair.
-  local rules='' b="block $mode quick" out4='' in4='' out6='' in6=''
+  # pf's grammar is: action [direction] [log] [quick] [af] ... -- the
+  # direction comes BEFORE quick. Baking "quick" into the prefix put it
+  # first and produced "block drop quick out inet", which pf rejects.
+  local rules='' b="block $mode" out4='' in4='' out6='' in6=''
   case "$direction" in
-    out)  out4="$b out inet from any to <netcut4>"
-          out6="$b out inet6 from any to <netcut6>" ;;
-    in)   in4="$b in inet from <netcut4> to any"
-          in6="$b in inet6 from <netcut6> to any" ;;
-    *)    out4="$b inet from any to <netcut4>"
-          in4="$b inet from <netcut4> to any"
-          out6="$b inet6 from any to <netcut6>"
-          in6="$b inet6 from <netcut6> to any" ;;
+    out)  out4="$b out quick inet from any to <netcut4>"
+          out6="$b out quick inet6 from any to <netcut6>" ;;
+    in)   in4="$b in quick inet from <netcut4> to any"
+          in6="$b in quick inet6 from <netcut6> to any" ;;
+    *)    out4="$b quick inet from any to <netcut4>"
+          in4="$b quick inet from <netcut4> to any"
+          out6="$b quick inet6 from any to <netcut6>"
+          in6="$b quick inet6 from <netcut6> to any" ;;
   esac
   [ -n "$v4" ] && rules="$rules
 table <netcut4> persist {$v4 }
@@ -539,8 +542,50 @@ serve() {
   done
 }
 
+# rulecheck -- generate every ruleset this daemon can emit and have pf parse
+# it. `pfctl -nf` validates without loading and needs no privileges, so this
+# runs in install.sh and by hand. It exists because a direction/quick ordering
+# bug shipped once behind a test that was reading the wrong exit code.
+rulecheck() {
+  local mode direction b out4 in4 out6 in6 rules bad=0 out rc
+  for mode in drop return; do
+    for direction in both out in; do
+      b="block $mode"; out4=''; in4=''; out6=''; in6=''
+      case "$direction" in
+        out)  out4="$b out quick inet from any to <netcut4>"
+              out6="$b out quick inet6 from any to <netcut6>" ;;
+        in)   in4="$b in quick inet from <netcut4> to any"
+              in6="$b in quick inet6 from <netcut6> to any" ;;
+        *)    out4="$b quick inet from any to <netcut4>"
+              in4="$b quick inet from <netcut4> to any"
+              out6="$b quick inet6 from any to <netcut6>"
+              in6="$b quick inet6 from <netcut6> to any" ;;
+      esac
+      rules="
+table <netcut4> persist {1.2.3.4 }
+$out4
+$in4
+table <netcut6> persist {2606:4700:7::1 }
+$out6
+$in6"
+      out=$(printf '%s\n' "$rules" | pfctl -nf - 2>&1); rc=$?
+      if [ "$rc" -ne 0 ]; then
+        bad=1
+        printf 'BAD  mode=%s direction=%s\n' "$mode" "$direction"
+        printf '%s\n' "$out" | grep -i 'syntax error' | head -2
+        printf '%s\n' "$rules" | grep -n 'block' | sed 's/^/     /'
+      else
+        printf 'ok   mode=%s direction=%s\n' "$mode" "$direction"
+      fi
+    done
+  done
+  [ "$bad" = 0 ] || { printf 'rulecheck FAILED\n' >&2; return 1; }
+  printf 'all rulesets parse\n'
+}
+
 case "${1:-}" in
   serve)   serve ;;
+  rulecheck) rulecheck ;;
   oneshot) shift; do_cut     "${1:-}" "${2:-asap}" "${3:-return}" ;;
   oneapp)  shift; do_cut_app "${1:-}" "${2:-asap}" "${3:-return}" ;;
   latch)   shift; do_latch "${1:-}" "${2:-drop}" "${3:-}" "${4:-both}" ;;
@@ -548,5 +593,5 @@ case "${1:-}" in
   probe)   shift; probe "${1:-}" ;;
   restore) restore cli ;;
   status)  status ;;
-  *) printf 'usage: netcutd {serve|oneshot <profile>|oneapp <app>|probe <app>|restore|status} [asap|seconds] [return|drop]\n' >&2; exit 2 ;;
+  *) printf 'usage: netcutd {serve|oneshot <profile>|oneapp <app>|probe <app>|rulecheck|restore|status} [asap|seconds] [return|drop]\n' >&2; exit 2 ;;
 esac
