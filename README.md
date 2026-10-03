@@ -5,7 +5,8 @@ Everything else on the machine stays online.
 
 **It reconnects itself after 20 seconds** — a countdown sits in the corner of
 the screen while the app is cut, and the moment it reaches zero the app is
-back. You never have to remember you left something offline.
+back. You never have to remember you left something offline. Set it to
+whatever you want, from the menu or with `netcut seconds 18`.
 
 The dot in the menu bar is the state and nothing else: **blue means that app's
 network is down right now, grey means it is connected.**
@@ -36,6 +37,7 @@ Press **⌘9**. That's the whole thing.
 |---|---|
 | ⌘9 | cut the app you are in; press again to reconnect |
 | after 20s | it reconnects on its own |
+| click the dot → Reconnect after | 5, 10, 15, 20, 30, 60 seconds, or Custom… |
 | the countdown | shows the app and the seconds left; gone when it hits zero |
 | the menu-bar dot | blue = down, grey = connected, red = something failed |
 | click the dot → Countdown | put it top left, top right or bottom |
@@ -50,6 +52,7 @@ From a terminal, if you prefer:
 ```sh
 netcut toggle            # same as ⌘9
 netcut pin Discord       # attach ⌘9 to one app so it stops following focus
+netcut seconds 18        # auto-reconnect window, 2-120s (menu sets it too)
 netcut pin off           # back to following focus
 netcut app Slack 3       # cut for 3 seconds, then restore by itself
 netcut probe Spotify     # dry run: what it would block, changes nothing
@@ -118,9 +121,11 @@ finds no sockets of its own and the cut refuses rather than cutting wider.
 - **Address guard.** Loopback, RFC1918, `100.64.0.0/10` (carrier-grade NAT and
   Tailscale), link-local, multicast and anything shorter than a /16 are
   refused, so a cut can't sever your own route or an SSH session.
-- **Bounded.** A cut reconnects itself after 20 seconds — both the app
-  counting down and the helper's own watchdog, so it comes back even if the
-  menu-bar app is killed mid-cut. Timed cuts from the CLI cap at 120s.
+- **Bounded.** A cut reconnects itself after its window (20s by default,
+  2–120s) — both the app counting down and the helper's own watchdog, so it
+  comes back even if the menu-bar app is killed mid-cut. The helper clamps
+  whatever window it is handed, so the bound belongs to the privileged side
+  rather than the caller.
 - **Watchdogs.** The helper restores if its own shell dies mid-cut and flushes
   the anchor on every start, so no block survives a crash or a reboot.
 - **Root code is root-owned.** The helper lives in `/usr/local/libexec/netcut`

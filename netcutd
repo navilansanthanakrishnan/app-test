@@ -152,12 +152,12 @@ kill_states() {
   # pfctl directly under xargs, with no `sh -c` wrapper: that wrapper was an
   # extra process per address for nothing.
   if [ -n "$1" ]; then
-    printf '%s\n' $1 | sed 's#/.*##' | xargs -P 24 -n1 pfctl -k
-    printf '%s\n' $1 | sed 's#/.*##' | xargs -P 24 -I@ pfctl -k 0.0.0.0/0 -k @
+    printf '%s\n' $1 | sed 's#/.*##' | xargs -P 24 -n1 pfctl -k >/dev/null 2>&1
+    printf '%s\n' $1 | sed 's#/.*##' | xargs -P 24 -I@ pfctl -k 0.0.0.0/0 -k @ >/dev/null 2>&1
   fi
   if [ -n "$2" ]; then
-    printf '%s\n' $2 | sed 's#/.*##' | xargs -P 24 -n1 pfctl -k
-    printf '%s\n' $2 | sed 's#/.*##' | xargs -P 24 -I@ pfctl -k ::/0 -k @
+    printf '%s\n' $2 | sed 's#/.*##' | xargs -P 24 -n1 pfctl -k >/dev/null 2>&1
+    printf '%s\n' $2 | sed 's#/.*##' | xargs -P 24 -I@ pfctl -k ::/0 -k @ >/dev/null 2>&1
   fi
   return 0
 }
@@ -322,7 +322,15 @@ cut_core() {
 # lifting the block lets the existing sockets resume, which is as close to
 # instant as this can get.
 do_latch() {
-  local spec=$1 mode=${2:-drop} bundle label t0 ms
+  local spec=$1 mode=${2:-drop} want=${3:-} bundle label t0 ms cap
+  # Whatever is asked for is clamped here: the daemon owns the bound, not the
+  # caller, so a bad or hostile number cannot strand an app offline.
+  cap=$NETCUT_LATCH_CAP
+  if printf '%s' "$want" | grep -qE '^[0-9]+$'; then
+    cap=$want
+    [ "$cap" -lt "$NETCUT_LATCH_MIN" ] && cap=$NETCUT_LATCH_MIN
+    [ "$cap" -gt "$NETCUT_MAX_SECONDS" ] && cap=$NETCUT_MAX_SECONDS
+  fi
   t0=$(now)
   bundle=$(resolve_app_spec "$spec") || { say "refused: unresolvable app '$spec'"
     printf 'error: no application matches %s\n' "$spec"; return 1; }
@@ -331,7 +339,7 @@ do_latch() {
 
   # A latch nobody releases still lifts, so a forgotten press cannot strand an
   # app offline for the rest of the day.
-  ( sleep "$NETCUT_LATCH_CAP"
+  ( sleep "$cap"
     [ -f "$STATE" ] && grep -q "^id=$BLOCK_ID\$" "$STATE" 2>/dev/null && restore "latch cap"
   ) >/dev/null 2>&1 &
   disown 2>/dev/null || true
@@ -340,8 +348,8 @@ do_latch() {
   local n4 n6
   n4=$(printf '%s' "$BLOCK_V4" | wc -w | tr -d ' ')
   n6=$(printf '%s' "$BLOCK_V6" | wc -w | tr -d ' ')
-  say "latch $label mode=$mode sockets=$BLOCK_N_BEFORE blocked=${n4}v4/${n6}v6 in=${ms}ms cap=${NETCUT_LATCH_CAP}s"
-  printf '__latched__ %s\n' "$NETCUT_LATCH_CAP"
+  say "latch $label mode=$mode sockets=$BLOCK_N_BEFORE blocked=${n4}v4/${n6}v6 in=${ms}ms cap=${cap}s"
+  printf '__latched__ %s\n' "$cap"
   printf '%s is cut off (%s addresses, %sms)\n' "$label" "$((n4 + n6))" "$ms"
 }
 
@@ -358,7 +366,7 @@ do_toggle() {
     printf 'network restored (%sms)\n' "$ms"
     return 0
   fi
-  do_latch "$1" "${2:-drop}"
+  do_latch "$1" "${2:-drop}" "${3:-}"
 }
 
 # do_cut <profile> <hold> <mode>
@@ -480,8 +488,13 @@ serve() {
       case "$verb" in
         cut)     { do_cut     "$a1" "${a2:-asap}" "${a3:-return}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
         app)     { do_cut_app "$a1" "${a2:-asap}" "${a3:-return}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
-        latch)   { do_latch   "$a1" "${a3:-drop}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
-        toggle)  { do_toggle  "$a1" "${a3:-drop}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
+        latch|toggle)
+          say "$verb request target='$a1' window='${a2:-default}' mode='${a3:-drop}'"
+          if [ "$verb" = latch ]; then
+            { do_latch "$a1" "${a3:-drop}" "$a2"; printf '__done__\n'; } > "$reply" 2>&1
+          else
+            { do_toggle "$a1" "${a3:-drop}" "$a2"; printf '__done__\n'; } > "$reply" 2>&1
+          fi ;;
         probe)   { probe      "$a1"; printf '__done__\n'; } > "$reply" 2>&1 ;;
         restore) { restore requested; printf '__restored__\nrestored\n__done__\n'; } > "$reply" 2>&1 ;;
         status)  { status; printf '__done__\n'; } > "$reply" 2>&1 ;;
@@ -496,8 +509,8 @@ case "${1:-}" in
   serve)   serve ;;
   oneshot) shift; do_cut     "${1:-}" "${2:-asap}" "${3:-return}" ;;
   oneapp)  shift; do_cut_app "${1:-}" "${2:-asap}" "${3:-return}" ;;
-  latch)   shift; do_latch "${1:-}" "${2:-drop}" ;;
-  toggle)  shift; do_toggle "${1:-}" "${2:-drop}" ;;
+  latch)   shift; do_latch "${1:-}" "${2:-drop}" "${3:-}" ;;
+  toggle)  shift; do_toggle "${1:-}" "${2:-drop}" "${3:-}" ;;
   probe)   shift; probe "${1:-}" ;;
   restore) restore cli ;;
   status)  status ;;

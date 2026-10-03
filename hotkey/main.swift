@@ -69,7 +69,7 @@ func logLine(_ message: String) {
 enum NetcutClient {
     static let runDir = "/var/run/netcut"
     static let fifoPath = "\(runDir)/ctl"
-    static let protocolNeeded = 4
+    static let protocolNeeded = 5
 
     struct Reply {
         let ok: Bool
@@ -90,8 +90,8 @@ enum NetcutClient {
     }
 
     /// Blocking. Callers run it off the main thread.
-    static func request(_ verb: String, arg: String = "-", mode: String = "-",
-                        timeout: TimeInterval = 15) -> Reply {
+    static func request(_ verb: String, arg: String = "-", window: String = "-",
+                        mode: String = "-", timeout: TimeInterval = 15) -> Reply {
         let proto = installedProtocol()
         guard proto >= protocolNeeded else {
             return Reply(ok: false, lines: proto == 0
@@ -100,7 +100,7 @@ enum NetcutClient {
         }
 
         let id = "\(getpid())-\(UInt64(Date().timeIntervalSince1970 * 1000))"
-        let line = "\(verb)|\(arg)|-|\(mode)|\(id)\n"
+        let line = "\(verb)|\(arg)|\(window)|\(mode)|\(id)\n"
 
         // O_NONBLOCK so a missing daemon is an error instead of a hang; a
         // single short line is written atomically either way.
@@ -127,6 +127,28 @@ enum NetcutClient {
             usleep(2000)   // 2 ms: a toggle answers in single-digit milliseconds
         }
         return Reply(ok: false, lines: ["error: the helper did not answer in \(Int(timeout))s"])
+    }
+}
+
+/// How long a cut lasts before it reconnects itself. One number, shared by
+/// the menu, the `netcut seconds` command and the daemon, which clamps it.
+enum AutoReconnect {
+    static let min = 2, max = 120, fallback = 20
+    static var path: String { "\(home)/.config/netcut/seconds" }
+
+    static func load() -> Int {
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let n = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return fallback }
+        return Swift.min(Swift.max(n, min), max)
+    }
+
+    static func save(_ n: Int) {
+        let clamped = Swift.min(Swift.max(n, min), max)
+        let url = URL(fileURLWithPath: path)
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? ("\(clamped)\n").write(to: url, atomically: true, encoding: .utf8)
     }
 }
 
@@ -277,6 +299,7 @@ final class Agent: NSObject, NSMenuDelegate {
     private let cutItem = NSMenuItem(title: "Cut Now", action: nil, keyEquivalent: "")
     private let targetItem = NSMenuItem(title: "Target", action: nil, keyEquivalent: "")
     private let placementItem = NSMenuItem(title: "Countdown", action: nil, keyEquivalent: "")
+    private let secondsItem = NSMenuItem(title: "Reconnect after", action: nil, keyEquivalent: "")
 
     private var indicator: Indicator = .connected
     private var target: Target = .frontmost
@@ -293,6 +316,7 @@ final class Agent: NSObject, NSMenuDelegate {
     private var statusPoll: Timer?
     private let overlay = CountdownOverlay()
     private var placement = Placement.load()
+    private var seconds = AutoReconnect.load()
     private var countdown: Timer?
     private var deadline: Date?
     private var downAppName = ""
@@ -318,6 +342,7 @@ final class Agent: NSObject, NSMenuDelegate {
         cutItem.action = #selector(cutNow)
         targetItem.submenu = NSMenu()
         placementItem.submenu = NSMenu()
+        secondsItem.submenu = NSMenu()
 
         let restore = NSMenuItem(title: "Restore Network Now", action: #selector(restoreNow), keyEquivalent: "")
         restore.target = self
@@ -330,6 +355,7 @@ final class Agent: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(cutItem)
         menu.addItem(targetItem)
+        menu.addItem(secondsItem)
         menu.addItem(placementItem)
         menu.addItem(.separator())
         menu.addItem(restore)
@@ -349,6 +375,8 @@ final class Agent: NSObject, NSMenuDelegate {
         }
         cutItem.isEnabled = !cutInFlight
         rebuildTargetMenu()
+        seconds = AutoReconnect.load()      // the CLI may have changed it
+        rebuildSecondsMenu()
         rebuildPlacementMenu()
     }
 
@@ -405,6 +433,52 @@ final class Agent: NSObject, NSMenuDelegate {
     }
 
 
+
+    private func rebuildSecondsMenu() {
+        guard let sub = secondsItem.submenu else { return }
+        sub.removeAllItems()
+        secondsItem.title = "Reconnect after: \(seconds)s"
+        var presets = [5, 10, 15, 20, 30, 60]
+        if !presets.contains(seconds) { presets.append(seconds); presets.sort() }
+        for n in presets {
+            let item = NSMenuItem(title: "\(n) seconds", action: #selector(pickSeconds(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = n
+            item.state = n == seconds ? .on : .off
+            sub.addItem(item)
+        }
+        sub.addItem(.separator())
+        let custom = NSMenuItem(title: "Custom…", action: #selector(pickCustomSeconds), keyEquivalent: "")
+        custom.target = self
+        sub.addItem(custom)
+    }
+
+    @objc private func pickSeconds(_ sender: NSMenuItem) {
+        guard let n = sender.representedObject as? Int else { return }
+        seconds = n
+        AutoReconnect.save(n)
+        logLine("auto-reconnect set to \(n)s")
+        render()
+    }
+
+    @objc private func pickCustomSeconds() {
+        let alert = NSAlert()
+        alert.messageText = "Reconnect after"
+        alert.informativeText = "Seconds a cut app stays offline before it comes back on its own (\(AutoReconnect.min)–\(AutoReconnect.max))."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 70, height: 24))
+        field.stringValue = "\(seconds)"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Set")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn,
+              let n = Int(field.stringValue.trimmingCharacters(in: .whitespaces)) else { return }
+        seconds = Swift.min(Swift.max(n, AutoReconnect.min), AutoReconnect.max)
+        AutoReconnect.save(seconds)
+        logLine("auto-reconnect set to \(seconds)s")
+        render()
+    }
 
     private func rebuildPlacementMenu() {
         guard let sub = placementItem.submenu else { return }
@@ -520,11 +594,14 @@ final class Agent: NSObject, NSMenuDelegate {
     @objc private func signalFire() { fire(source: "signal") }
 
     @objc private func signalSelfTest() {
-        logLine("self-test: dot blue and a 6s countdown, nothing is being cut")
+        // Uses the configured window, so this also proves the agent is
+        // reading the same setting the CLI writes.
+        seconds = AutoReconnect.load()
+        logLine("self-test: dot blue and a \(seconds)s countdown, nothing is being cut")
         downAppName = "self-test"
         indicator = .down("self-test")
         render()
-        startCountdownDisplayOnly(seconds: 6)
+        startCountdownDisplayOnly(seconds: seconds)
     }
 
     /// The countdown without the network half, so the overlay can be checked
@@ -624,7 +701,9 @@ final class Agent: NSObject, NSMenuDelegate {
         render()
         logLine("\(source): cut \(name) [\(bundlePath)]")
 
-        run(arguments: ["--markers", "toggle", bundlePath, "drop"], label: name) { [weak self] code, output in
+        seconds = AutoReconnect.load()
+        run(arguments: ["--markers", "toggle", bundlePath, "drop"], label: name,
+            seconds: seconds) { [weak self] code, output in
             MainActor.assumeIsolated { self?.finish(name: name, code: code, output: output) }
         }
     }
@@ -643,7 +722,7 @@ final class Agent: NSObject, NSMenuDelegate {
     /// Sends one request to the daemon off the main thread and hands the
     /// reply back on it. No child process: the keypress path is a write to a
     /// FIFO and a poll of one file.
-    private func run(arguments: [String], label: String,
+    private func run(arguments: [String], label: String, seconds: Int? = nil,
                      completion: @escaping @Sendable (Int32, String) -> Void) {
         let verb: String, arg: String, mode: String
         switch arguments.first(where: { !$0.hasPrefix("--") }) ?? "status" {
@@ -656,7 +735,9 @@ final class Agent: NSObject, NSMenuDelegate {
         }
         let started = Date()
         DispatchQueue.global(qos: .userInitiated).async {
-            let reply = NetcutClient.request(verb, arg: arg, mode: mode,
+            let reply = NetcutClient.request(verb, arg: arg,
+                                             window: seconds.map(String.init) ?? "-",
+                                             mode: mode,
                                              timeout: verb == "status" ? 5 : 8)
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             DispatchQueue.main.async {
@@ -776,7 +857,7 @@ final class Agent: NSObject, NSMenuDelegate {
             glyph = "●"
             color = hotKeyWorks ? .tertiaryLabelColor : .systemOrange
             tooltip = hotKeyWorks
-                ? "netcut — connected. \(hotKeyLabel) cuts \(target.describedTarget)"
+                ? "netcut — connected. \(hotKeyLabel) cuts \(target.describedTarget) for \(seconds)s"
                 : "netcut — \(hotKeyLabel) could not be registered"
         case .down(let name):
             glyph = "●"
