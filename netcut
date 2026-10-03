@@ -300,14 +300,16 @@ diag() {
   # where the baseline was too small to mean anything. A tool whose job is to
   # replace guessing must not produce confident noise.
   local floor=$((secs * 2048))
-  if [ "$bo" -lt "$floor" ]; then
-    printf 'outbound: baseline was only %s - too little to judge\n' "$(human "$bo" "$secs")"
-  elif [ "$do_" -lt $((bo / 5)) ]; then
-    printf 'outbound: stopped, as asked (%s -> %s)\n' "$(human "$bo" "$secs")" "$(human "$do_" "$secs")"
-  else
-    printf 'outbound: STILL FLOWING (%s -> %s) - the block did not take\n' "$(human "$bo" "$secs")" "$(human "$do_" "$secs")"
-    printf '          check: netcut status\n'
-  fi
+  # No verdict on outbound, ever. nettop counts what the process writes to
+  # the socket; pf drops the packet afterwards, so a working block still
+  # reads as full outbound. Measured under a both-ways block, where nothing
+  # can leave the machine: inbound went to 0 and outbound still read 348KB.
+  # The old "STILL FLOWING - the block did not take" line was wrong by
+  # construction and sent a debugging session down the wrong road.
+  printf 'outbound: %s -> %s (not a verdict: nettop counts socket writes,\n' \
+    "$(human "$bo" "$secs")" "$(human "$do_" "$secs")"
+  printf '          and pf drops the packet after that, so a working block\n'
+  printf '          still reads as outbound traffic)\n'
 
   if [ "$bi" -lt "$floor" ]; then
     printf 'inbound:  baseline was only %s - too little to judge\n' "$(human "$bi" "$secs")"
