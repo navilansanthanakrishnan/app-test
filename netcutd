@@ -171,6 +171,15 @@ kill_states() {
 # On success the block is up and these are set for the caller:
 apply_block() {
   local label=$1 proc_match=$2 hold_domains=$3 hold_cidrs=$4 mode=$5 tag=$6
+  local direction=${7:-both}
+  # Checked here because both the timed cut and the latch come through this
+  # function; it used to be checked only in cut_core, so a latch with a
+  # nonsense direction quietly became a full block.
+  case "$direction" in
+    both|out|in) ;;
+    *) say "refused: bad direction '$direction'"
+       printf 'error: direction must be both, out or in\n'; return 1 ;;
+  esac
   BLOCK_V4=''; BLOCK_V6=''; BLOCK_BEFORE=''; BLOCK_N_BEFORE=0
   BLOCK_ID=''; BLOCK_T0=''; BLOCK_SKIPPED=0
 
@@ -205,15 +214,30 @@ GUARD
     printf '       (%s live socket(s), %s address(es) refused by the guard)\n' "$n_before" "$skipped"
     return 1; }
 
-  local rules='' b="block $mode quick"
+  # Direction. "both" is a hard disconnect; "out" leaves the peer's packets
+  # arriving while nothing of ours reaches it (a half-open connection, which
+  # is the case a server's own timeout handling is easiest to get wrong on);
+  # "in" is the mirror. pf's `out` matches packets leaving an interface and
+  # `in` those arriving, so each case drops one rule of the pair.
+  local rules='' b="block $mode quick" out4='' in4='' out6='' in6=''
+  case "$direction" in
+    out)  out4="$b out inet from any to <netcut4>"
+          out6="$b out inet6 from any to <netcut6>" ;;
+    in)   in4="$b in inet from <netcut4> to any"
+          in6="$b in inet6 from <netcut6> to any" ;;
+    *)    out4="$b inet from any to <netcut4>"
+          in4="$b inet from <netcut4> to any"
+          out6="$b inet6 from any to <netcut6>"
+          in6="$b inet6 from <netcut6> to any" ;;
+  esac
   [ -n "$v4" ] && rules="$rules
 table <netcut4> persist {$v4 }
-$b inet from any to <netcut4>
-$b inet from <netcut4> to any"
+$out4
+$in4"
   [ -n "$v6" ] && rules="$rules
 table <netcut6> persist {$v6 }
-$b inet6 from any to <netcut6>
-$b inet6 from <netcut6> to any"
+$out6
+$in6"
 
   local t_cut
   t_cut=$(now)
@@ -225,8 +249,8 @@ $b inet6 from <netcut6> to any"
   local token id
   token=$(pfctl -E 2>&1 | sed -n 's/.*Token *: *//p' | tr -d ' ')
   id=$$-$(date +%s)
-  printf 'id=%s\ntoken=%s\ntarget=%s\nhold=%s\nmode=%s\n' \
-    "$id" "$token" "$label" "$tag" "$mode" > "$STATE"
+  printf 'id=%s\ntoken=%s\ntarget=%s\nhold=%s\nmode=%s\ndirection=%s\n' \
+    "$id" "$token" "$label" "$tag" "$mode" "$direction" > "$STATE"
 
   kill_states "$v4" "$v6"
 
@@ -237,6 +261,7 @@ $b inet6 from <netcut6> to any"
 # cut_core <label> <proc_match> <hold_domains> <hold_cidrs> <hold> <mode>
 cut_core() {
   local label=$1 proc_match=$2 hold_domains=$3 hold_cidrs=$4 hold=$5 mode=${6:-return}
+  local direction=${7:-both}
 
   case "$mode" in return|drop) ;; *) printf 'error: bad mode\n'; return 1 ;; esac
 
@@ -252,7 +277,7 @@ cut_core() {
     cap=$hold
   fi
   apply_block "$label" "$proc_match" "$hold_domains" "$hold_cidrs" "$mode" "$hold" \
-    || return 1
+    "$direction" || return 1
   # Quoted: the socket list is multi-line and word-splitting would shred it.
   local before="$BLOCK_BEFORE" n_before="$BLOCK_N_BEFORE" skipped="$BLOCK_SKIPPED"
   local v4="$BLOCK_V4" v6="$BLOCK_V6" t_cut="$BLOCK_T0" id="$BLOCK_ID"
@@ -322,7 +347,7 @@ cut_core() {
 # lifting the block lets the existing sockets resume, which is as close to
 # instant as this can get.
 do_latch() {
-  local spec=$1 mode=${2:-drop} want=${3:-} bundle label t0 ms cap
+  local spec=$1 mode=${2:-drop} want=${3:-} direction=${4:-both} bundle label t0 ms cap
   # Whatever is asked for is clamped here: the daemon owns the bound, not the
   # caller, so a bad or hostile number cannot strand an app offline.
   cap=$NETCUT_LATCH_CAP
@@ -335,7 +360,7 @@ do_latch() {
   bundle=$(resolve_app_spec "$spec") || { say "refused: unresolvable app '$spec'"
     printf 'error: no application matches %s\n' "$spec"; return 1; }
   label=$(app_label "$bundle")
-  apply_block "$label" "$(proc_match_for "$bundle")" '' '' "$mode" latch || return 1
+  apply_block "$label" "$(proc_match_for "$bundle")" '' '' "$mode" latch "$direction" || return 1
 
   # A latch nobody releases still lifts, so a forgotten press cannot strand an
   # app offline for the rest of the day.
@@ -348,9 +373,13 @@ do_latch() {
   local n4 n6
   n4=$(printf '%s' "$BLOCK_V4" | wc -w | tr -d ' ')
   n6=$(printf '%s' "$BLOCK_V6" | wc -w | tr -d ' ')
-  say "latch $label mode=$mode sockets=$BLOCK_N_BEFORE blocked=${n4}v4/${n6}v6 in=${ms}ms cap=${cap}s"
+  say "latch $label mode=$mode dir=$direction sockets=$BLOCK_N_BEFORE blocked=${n4}v4/${n6}v6 in=${ms}ms cap=${cap}s"
   printf '__latched__ %s\n' "$cap"
-  printf '%s is cut off (%s addresses, %sms)\n' "$label" "$((n4 + n6))" "$ms"
+  case "$direction" in
+    out) printf '%s cannot send (%s addresses, %sms) - its traffic still arrives\n' "$label" "$((n4 + n6))" "$ms" ;;
+    in)  printf '%s cannot receive (%s addresses, %sms) - its own packets still leave\n' "$label" "$((n4 + n6))" "$ms" ;;
+    *)   printf '%s is cut off (%s addresses, %sms)\n' "$label" "$((n4 + n6))" "$ms" ;;
+  esac
 }
 
 # do_toggle <app spec> <mode>
@@ -366,7 +395,7 @@ do_toggle() {
     printf 'network restored (%sms)\n' "$ms"
     return 0
   fi
-  do_latch "$1" "${2:-drop}" "${3:-}"
+  do_latch "$1" "${2:-drop}" "${3:-}" "${4:-both}"
 }
 
 # do_cut <profile> <hold> <mode>
@@ -391,13 +420,13 @@ do_cut() {
 # do_cut_app <app spec> <hold> <mode>
 # No profile: the target is found entirely from the sockets it holds right now.
 do_cut_app() {
-  local spec=$1 hold=$2 mode=${3:-return} bundle label
+  local spec=$1 hold=$2 mode=${3:-return} direction=${4:-both} bundle label
   bundle=$(resolve_app_spec "$spec") || { say "refused: unresolvable app '$spec'"
     printf 'error: no application matches %s\n' "$spec"
     printf '       give a full path to a .app bundle or .exe, or an installed app name\n'
     return 1; }
   label=$(app_label "$bundle")
-  cut_core "$label" "$(proc_match_for "$bundle")" '' '' "$hold" "$mode"
+  cut_core "$label" "$(proc_match_for "$bundle")" '' '' "$hold" "$mode" "$direction"
 }
 
 # probe <app spec> - what a cut would do. Reads only; never touches pf, and
@@ -431,7 +460,7 @@ PROBE
 status() {
   if [ -f "$STATE" ]; then
     if grep -q '^hold=latch$' "$STATE" 2>/dev/null; then
-      printf 'LATCHED (down until the next toggle): %s\n' "$(tr '\n' ' ' < "$STATE")"
+      printf 'LATCHED: %s\n' "$(tr '\n' ' ' < "$STATE")"
     else
       printf 'cut ACTIVE: %s\n' "$(tr '\n' ' ' < "$STATE")"
     fi
@@ -463,7 +492,7 @@ serve() {
   # instead of seeing EOF.
   exec 3<> "$NETCUT_FIFO"
 
-  local line verb a1 a2 a3 id reply fails=0
+  local line verb a1 a2 a3 id reply fails=0 dir
   while :; do
     if ! read -r line <&3; then
       fails=$((fails + 1))
@@ -472,7 +501,7 @@ serve() {
     fi
     fails=0
     if [ -n "$line" ]; then
-      verb=''; a1=''; a2=''; a3=''; id=''
+      verb=''; a1=''; a2=''; a3=''; id=''; dir=both
       # Pipe-delimited so that an empty field stays a field and an app path may
       # contain spaces. Whitespace splitting silently shifted the request id
       # into another field whenever an argument was empty.
@@ -484,16 +513,21 @@ serve() {
       # so that nothing here can be swapped for a symlink. So the daemon
       # sweeps what the last requests left behind.
       find "$NETCUT_RUN_DIR" -name 'reply.*' -mmin +5 -delete 2>/dev/null
+      # mode may arrive as "drop" or "drop:out"
+      dir=both
+      case "$a3" in
+        *:*) dir=${a3#*:}; a3=${a3%%:*} ;;
+      esac
       reply="$NETCUT_RUN_DIR/reply.${id:-nil}"
       case "$verb" in
         cut)     { do_cut     "$a1" "${a2:-asap}" "${a3:-return}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
-        app)     { do_cut_app "$a1" "${a2:-asap}" "${a3:-return}"; printf '__done__\n'; } > "$reply" 2>&1 ;;
+        app)     { do_cut_app "$a1" "${a2:-asap}" "${a3:-return}" "$dir"; printf '__done__\n'; } > "$reply" 2>&1 ;;
         latch|toggle)
-          say "$verb request target='$a1' window='${a2:-default}' mode='${a3:-drop}'"
+          say "$verb request target='$a1' window='${a2:-default}' mode='${a3:-drop}' dir='$dir'"
           if [ "$verb" = latch ]; then
-            { do_latch "$a1" "${a3:-drop}" "$a2"; printf '__done__\n'; } > "$reply" 2>&1
+            { do_latch "$a1" "${a3:-drop}" "$a2" "$dir"; printf '__done__\n'; } > "$reply" 2>&1
           else
-            { do_toggle "$a1" "${a3:-drop}" "$a2"; printf '__done__\n'; } > "$reply" 2>&1
+            { do_toggle "$a1" "${a3:-drop}" "$a2" "$dir"; printf '__done__\n'; } > "$reply" 2>&1
           fi ;;
         probe)   { probe      "$a1"; printf '__done__\n'; } > "$reply" 2>&1 ;;
         restore) { restore requested; printf '__restored__\nrestored\n__done__\n'; } > "$reply" 2>&1 ;;
@@ -509,8 +543,8 @@ case "${1:-}" in
   serve)   serve ;;
   oneshot) shift; do_cut     "${1:-}" "${2:-asap}" "${3:-return}" ;;
   oneapp)  shift; do_cut_app "${1:-}" "${2:-asap}" "${3:-return}" ;;
-  latch)   shift; do_latch "${1:-}" "${2:-drop}" "${3:-}" ;;
-  toggle)  shift; do_toggle "${1:-}" "${2:-drop}" "${3:-}" ;;
+  latch)   shift; do_latch "${1:-}" "${2:-drop}" "${3:-}" "${4:-both}" ;;
+  toggle)  shift; do_toggle "${1:-}" "${2:-drop}" "${3:-}" "${4:-both}" ;;
   probe)   shift; probe "${1:-}" ;;
   restore) restore cli ;;
   status)  status ;;

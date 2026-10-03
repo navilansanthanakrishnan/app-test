@@ -42,6 +42,7 @@ stays live everywhere, so you can always reconnect from wherever you are.
 |---|---|
 | ⌘9 | cut the app you are in; press again to reconnect |
 | after 20s | it reconnects on its own |
+| click the dot → Direction | both ways, outbound only, or inbound only |
 | click the dot → Key | three choices, and a bare key needs an app pinned |
 | click the dot → Reconnect after | 5, 10, 15, 20, 30, 60 seconds, or Custom… |
 | the countdown | shows the app and the seconds left; gone when it hits zero |
@@ -58,6 +59,8 @@ From a terminal, if you prefer:
 ```sh
 netcut toggle            # same as ⌘9
 netcut pin Discord       # attach ⌘9 to one app so it stops following focus
+netcut direction out     # half-open: it cannot send, the peer's traffic arrives
+netcut direction both    # a full disconnect (the default)
 netcut key grave         # fire on backtick instead: cmd9 | q | grave
 netcut seconds 18        # auto-reconnect window, 2-120s (menu sets it too)
 netcut pin off           # back to following focus
@@ -79,7 +82,38 @@ The exception is while an app is cut: the key stays live until it reconnects
 (at most your configured window) so a second press always works, wherever you
 are.
 
+## One-way mode
+
+`Direction` decides which way the block runs:
+
+- **Both ways** (default) — an ordinary disconnect.
+- **Outbound only** — nothing the app sends gets out, but the peer's packets
+  still arrive. The connection is *half-open*: the server keeps talking, and
+  as far as it can tell you have gone quiet.
+- **Inbound only** — the mirror.
+
+Half-open is the state servers get wrong. A client that crashes is easy; a
+client that keeps receiving while its own packets vanish is the one that sits
+in your session table until something times out, and the timeout is usually
+the thing nobody tested. Pointed at your own service, this reproduces it on
+demand.
+
+**It only bites on UDP.** On TCP, blocking one direction stalls the
+connection within a second or two anyway — no ACKs leave, the peer's send
+window fills, and the stream stops. You get a half-open window worth watching
+only where the protocol does not acknowledge, which in practice means UDP.
+
 ## Please don't point this at a multiplayer game
+
+**Especially not in one-way mode.** A cut that leaves you watching a session
+the other players cannot see you in, and then puts you back, is a lag switch
+in the most literal sense — the whole value of the asymmetry is that it is
+one-sided. Everything below applies to the normal mode; it applies more here.
+
+This exists because half-open connection handling is a real thing to test
+against a server you run. There is no check stopping you from aiming it
+somewhere else. That is a choice, and this paragraph is what replaced the
+check.
 
 **It will let you. There is no check — that is deliberate, and this is what
 replaced it.**

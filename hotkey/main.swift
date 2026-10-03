@@ -69,7 +69,7 @@ func logLine(_ message: String) {
 enum NetcutClient {
     static let runDir = "/var/run/netcut"
     static let fifoPath = "\(runDir)/ctl"
-    static let protocolNeeded = 5
+    static let protocolNeeded = 6
 
     struct Reply {
         let ok: Bool
@@ -177,6 +177,47 @@ enum KeyBinding: String, CaseIterable {
     }
 }
 
+/// Which way the block runs.
+///
+/// `both` is an ordinary disconnect. `out` leaves the peer's packets arriving
+/// while nothing of ours reaches it — a half-open connection, which is the
+/// state a server's own timeout handling is easiest to get wrong on. `in` is
+/// the mirror.
+enum Direction: String, CaseIterable {
+    case both, out, `in`
+
+    var label: String {
+        switch self {
+        case .both: return "Both ways (a full disconnect)"
+        case .out:  return "Outbound only (it cannot send)"
+        case .in:   return "Inbound only (it cannot receive)"
+        }
+    }
+    var short: String {
+        switch self {
+        case .both: return "both ways"
+        case .out:  return "cannot send"
+        case .in:   return "cannot receive"
+        }
+    }
+
+    static var path: String { "\(home)/.config/netcut/direction" }
+
+    static func load() -> Direction {
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let d = Direction(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return .both }
+        return d
+    }
+
+    func save() {
+        let url = URL(fileURLWithPath: Direction.path)
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? (rawValue + "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
 /// How long a cut lasts before it reconnects itself. One number, shared by
 /// the menu, the `netcut seconds` command and the daemon, which clamps it.
 enum AutoReconnect {
@@ -237,6 +278,9 @@ final class CountdownOverlay {
     private var window: NSWindow?
     private let label = NSTextField(labelWithString: "")
     private let dot = NSTextField(labelWithString: "●")
+    /// Set when the cut is one-way, so the overlay never implies a full
+    /// disconnect that is not happening.
+    var overlayDirectionNote = ""   
 
     private func build() -> NSWindow {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 176, height: 44),
@@ -285,7 +329,8 @@ final class CountdownOverlay {
     }
 
     func update(app: String, remaining: Int) {
-        label.stringValue = "\(app)  ·  \(max(0, remaining))s"
+        let suffix = overlayDirectionNote.isEmpty ? "" : "  ·  \(overlayDirectionNote)"
+        label.stringValue = "\(app)  ·  \(max(0, remaining))s\(suffix)"
     }
 
     func reposition(_ placement: Placement) {
@@ -348,6 +393,7 @@ final class Agent: NSObject, NSMenuDelegate {
     private let placementItem = NSMenuItem(title: "Countdown", action: nil, keyEquivalent: "")
     private let secondsItem = NSMenuItem(title: "Reconnect after", action: nil, keyEquivalent: "")
     private let keyItem = NSMenuItem(title: "Key", action: nil, keyEquivalent: "")
+    private let directionItem = NSMenuItem(title: "Direction", action: nil, keyEquivalent: "")
 
     private var indicator: Indicator = .connected
     private var target: Target = .frontmost
@@ -366,6 +412,7 @@ final class Agent: NSObject, NSMenuDelegate {
     private var placement = Placement.load()
     private var seconds = AutoReconnect.load()
     private var binding = KeyBinding.load()
+    private var direction = Direction.load()
     private var handlerInstalled = false
     private var armed = false
     private var countdown: Timer?
@@ -381,7 +428,7 @@ final class Agent: NSObject, NSMenuDelegate {
         updateArming()
         startSettingsWatch()
         render()
-        logLine("started (helper protocol=\(NetcutClient.installedProtocol()), key=\(binding.label), armed=\(armed), countdown=\(placement.label), window=\(seconds)s)")
+        logLine("started (helper protocol=\(NetcutClient.installedProtocol()), key=\(binding.label), armed=\(armed), countdown=\(placement.label), window=\(seconds)s, direction=\(direction.rawValue))")
         NSApplication.shared.run()
     }
 
@@ -396,6 +443,7 @@ final class Agent: NSObject, NSMenuDelegate {
         placementItem.submenu = NSMenu()
         secondsItem.submenu = NSMenu()
         keyItem.submenu = NSMenu()
+        directionItem.submenu = NSMenu()
 
         let restore = NSMenuItem(title: "Restore Network Now", action: #selector(restoreNow), keyEquivalent: "")
         restore.target = self
@@ -408,6 +456,7 @@ final class Agent: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(cutItem)
         menu.addItem(targetItem)
+        menu.addItem(directionItem)
         menu.addItem(keyItem)
         menu.addItem(secondsItem)
         menu.addItem(placementItem)
@@ -431,6 +480,8 @@ final class Agent: NSObject, NSMenuDelegate {
         rebuildTargetMenu()
         seconds = AutoReconnect.load()      // the CLI may have changed it
         if KeyBinding.load() != binding { changeBinding(to: KeyBinding.load()) }
+        direction = Direction.load()
+        rebuildDirectionMenu()
         rebuildKeyMenu()
         rebuildSecondsMenu()
         rebuildPlacementMenu()
@@ -495,6 +546,33 @@ final class Agent: NSObject, NSMenuDelegate {
     }
 
 
+
+    private func rebuildDirectionMenu() {
+        guard let sub = directionItem.submenu else { return }
+        sub.removeAllItems()
+        directionItem.title = "Direction: \(direction.short)"
+        for option in Direction.allCases {
+            let item = NSMenuItem(title: option.label, action: #selector(pickDirection(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = option.rawValue
+            item.state = option == direction ? .on : .off
+            sub.addItem(item)
+        }
+        sub.addItem(.separator())
+        let note = NSMenuItem(title: "One-way only bites on UDP; TCP stalls either way",
+                              action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        sub.addItem(note)
+    }
+
+    @objc private func pickDirection(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let option = Direction(rawValue: raw) else { return }
+        direction = option
+        option.save()
+        logLine("direction set to \(option.rawValue)")
+        render()
+    }
 
     private func rebuildKeyMenu() {
         guard let sub = keyItem.submenu else { return }
@@ -783,6 +861,7 @@ final class Agent: NSObject, NSMenuDelegate {
                 let pinned = loadPinnedTarget()
                 let key = KeyBinding.load()
                 self.seconds = AutoReconnect.load()
+                self.direction = Direction.load()
                 if key != self.binding { self.changeBinding(to: key); return }
                 if pinned != self.target { self.target = pinned; self.updateArming(); self.render() }
                 else { self.updateArming() }
@@ -862,8 +941,9 @@ final class Agent: NSObject, NSMenuDelegate {
         logLine("\(source): cut \(name) [\(bundlePath)]")
 
         seconds = AutoReconnect.load()
-        run(arguments: ["--markers", "toggle", bundlePath, "drop"], label: name,
-            seconds: seconds) { [weak self] code, output in
+        direction = Direction.load()
+        run(arguments: ["--markers", "toggle", bundlePath, "drop:\(direction.rawValue)"],
+            label: name, seconds: seconds) { [weak self] code, output in
             MainActor.assumeIsolated { self?.finish(name: name, code: code, output: output) }
         }
     }
@@ -931,6 +1011,7 @@ final class Agent: NSObject, NSMenuDelegate {
     private func startCountdown(seconds: Int) {
         countdown?.invalidate()
         deadline = Date().addingTimeInterval(TimeInterval(seconds))
+        overlay.overlayDirectionNote = direction == .both ? "" : direction.short
         overlay.show(app: downAppName, remaining: seconds, placement: placement)
         countdown = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {

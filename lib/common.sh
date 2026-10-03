@@ -13,10 +13,11 @@ NETCUT_MAX_SECONDS=${NETCUT_MAX_SECONDS:-120}
 # delimited fields plus the "app" and "probe" verbs. 3 = "latch" and "toggle".
 # 4 = the latch reply carries its auto-reenable window in seconds.
 # 5 = the caller may ask for that window.
+# 6 = the mode field may carry a direction, as mode:direction.
 # netcutd publishes the version it speaks in $NETCUT_RUN_DIR/protocol so the
 # client can tell an old installed helper from a current one without waiting
 # out a timeout on a verb that helper answers with silence.
-NETCUT_PROTOCOL=${NETCUT_PROTOCOL:-5}
+NETCUT_PROTOCOL=${NETCUT_PROTOCOL:-6}
 NETCUT_LATCH_CAP=${NETCUT_LATCH_CAP:-20}     # default auto-reenable, seconds
 NETCUT_LATCH_MIN=${NETCUT_LATCH_MIN:-2}      # a request below this is clamped up
 # The chosen value lives in the user's config so the menu, the CLI and the
