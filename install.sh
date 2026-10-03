@@ -130,8 +130,20 @@ cat > "$HOME/Library/LaunchAgents/$AGENT_LABEL.plist" <<PLIST
 PLIST
 printf '</plist>\n' >> "$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 
+# bootout is not synchronous. Bootstrapping while the old instance is still
+# exiting fails with an I/O error, and silencing that is how the agent ended
+# up not installed at all while the script said nothing.
 launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_LABEL.plist" >/dev/null 2>&1 || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  launchctl print "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || break
+  sleep 0.3
+done
+boot_err=$(launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_LABEL.plist" 2>&1) || {
+  sleep 1
+  boot_err=$(launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_LABEL.plist" 2>&1) || {
+    printf 'could not start %s: %s\n' "$AGENT_LABEL" "$boot_err" >&2
+    exit 1; }
+}
 sleep 1
 
 # ------------------------------------------------------------------- verify
