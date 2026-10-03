@@ -8,6 +8,7 @@ rm -f "$HOME/Library/LaunchAgents/com.netcut.hotkey.plist"
 rm -rf "/Applications/App Test.app"
 rm -f "$HOME/.local/bin/netcut"
 rm -rf "$HOME/.local/libexec/netcut"
+rm -rf "$HOME/.config/netcut"
 
 printf 'Removing the privileged helper (needs your password)...\n'
 sudo launchctl bootout system/com.netcut.helper >/dev/null 2>&1

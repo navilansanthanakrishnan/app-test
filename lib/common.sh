@@ -11,11 +11,12 @@ NETCUT_PROFILE_DIR=${NETCUT_PROFILE_DIR:-$NETCUT_LIBEXEC/profiles}
 NETCUT_MAX_SECONDS=${NETCUT_MAX_SECONDS:-120}
 # Request-protocol version. 1 = whitespace-split, profiles only. 2 = pipe-
 # delimited fields plus the "app" and "probe" verbs. 3 = "latch" and "toggle".
+# 4 = the latch reply carries its auto-reenable window in seconds.
 # netcutd publishes the version it speaks in $NETCUT_RUN_DIR/protocol so the
 # client can tell an old installed helper from a current one without waiting
 # out a timeout on a verb that helper answers with silence.
-NETCUT_PROTOCOL=${NETCUT_PROTOCOL:-3}
-NETCUT_LATCH_CAP=${NETCUT_LATCH_CAP:-1800}   # a held cut still lifts eventually
+NETCUT_PROTOCOL=${NETCUT_PROTOCOL:-4}
+NETCUT_LATCH_CAP=${NETCUT_LATCH_CAP:-20}     # a latch auto-reenables after this
 NETCUT_DEFAULT_HOLD=${NETCUT_DEFAULT_HOLD:-asap}
 
 # Addresses that must never be blocked: loopback, RFC1918, the CGNAT/tailnet
@@ -81,6 +82,56 @@ guard_ok() {
     esac
   fi
   return 0
+}
+
+# guard_filter -- reads candidate addresses on stdin, prints "4 <addr>" or
+# "6 <addr>" for each one that is safe to block, and "skip" for each refusal.
+#
+# One awk process for the whole list. The per-address bash version forked
+# about ten subshells per address (~3.5ms each, ~120ms on a browser), which
+# was the single largest cost in a cut. No bitwise operators: macOS awk has
+# no and()/compl(), so a prefix test is a numeric range test instead, which
+# is exact for the properly-aligned prefixes in the never-block list.
+guard_filter() {
+  awk -v v4list="$NETCUT_NEVER_BLOCK_V4" '
+    function toint(a,   p) {
+      split(a, p, ".")
+      return (p[1] * 16777216) + (p[2] * 65536) + (p[3] * 256) + p[4]
+    }
+    BEGIN {
+      n = split(v4list, B, " ")
+      for (i = 1; i <= n; i++) {
+        split(B[i], q, "/")
+        lo[i] = toint(q[1]); len[i] = q[2] + 0
+        hi[i] = lo[i] + (2 ^ (32 - len[i])) - 1
+      }
+    }
+    {
+      addr = $0
+      if (addr == "") next
+      sl = index(addr, "/")
+      if (sl) { pfx = substr(addr, sl + 1) + 0; base = substr(addr, 1, sl - 1) }
+      else    { pfx = -1; base = addr }
+
+      if (index(base, ":")) {                       # IPv6
+        if (pfx == -1) pfx = 128
+        if (pfx < 32) { print "skip"; next }
+        low = tolower(base)
+        if (low == "::1" || low ~ /^fe80:/ || low ~ /^fd/ || low ~ /^fc/ || low ~ /^ff0/) {
+          print "skip"; next
+        }
+        print "6 " addr; next
+      }
+
+      if (base !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) next
+      if (pfx == -1) pfx = 32
+      if (pfx < 16) { print "skip"; next }
+      ip = toint(base)
+      for (i = 1; i <= n; i++) {
+        if (ip >= lo[i] && ip <= hi[i]) { print "skip"; next }
+      }
+      print "4 " addr
+    }'
 }
 
 # first_bundle <executable path> -> the outermost .app, or the basename

@@ -60,38 +60,191 @@ func logLine(_ message: String) {
     FileHandle.standardOutput.write(data)
 }
 
-func netcutExecutable() -> String? {
-    let candidates = [
-        "\(home)/.local/bin/netcut",
-        "\(home)/.local/libexec/netcut/netcut",
-        "/usr/local/bin/netcut",
-    ]
-    for path in candidates {
-        var resolved = path
-        while let link = try? FileManager.default.destinationOfSymbolicLink(atPath: resolved) {
-            resolved = link.hasPrefix("/") ? link
-                : URL(fileURLWithPath: resolved).deletingLastPathComponent()
-                    .appendingPathComponent(link).path
+
+/// Speaks netcutd's FIFO protocol directly.
+///
+/// ⌘9 used to spawn the `netcut` shell script, which cost a bash startup
+/// (~25 ms) on every press for nothing — the protocol is one line in and one
+/// file out. The CLI still exists for terminal use; this is the hot path.
+enum NetcutClient {
+    static let runDir = "/var/run/netcut"
+    static let fifoPath = "\(runDir)/ctl"
+    static let protocolNeeded = 4
+
+    struct Reply {
+        let ok: Bool
+        let lines: [String]
+        var text: String { lines.joined(separator: " | ") }
+        func has(_ marker: String) -> Bool { lines.contains { $0.hasPrefix(marker) } }
+        /// The latch reply carries the cap, so the countdown cannot disagree
+        /// with the daemon's own auto-restore.
+        var latchedSeconds: Int? {
+            guard let line = lines.first(where: { $0.hasPrefix("__latched__") }) else { return nil }
+            return Int(line.split(separator: " ").dropFirst().first.map(String.init) ?? "")
         }
-        if FileManager.default.isExecutableFile(atPath: resolved) { return path }
     }
-    return nil
+
+    static func installedProtocol() -> Int {
+        guard let raw = try? String(contentsOfFile: "\(runDir)/protocol", encoding: .utf8) else { return 0 }
+        return Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+    }
+
+    /// Blocking. Callers run it off the main thread.
+    static func request(_ verb: String, arg: String = "-", mode: String = "-",
+                        timeout: TimeInterval = 15) -> Reply {
+        let proto = installedProtocol()
+        guard proto >= protocolNeeded else {
+            return Reply(ok: false, lines: proto == 0
+                ? ["error: the netcut helper is not running (run install.sh)"]
+                : ["error: the installed helper speaks protocol \(proto), this needs \(protocolNeeded) — re-run install.sh"])
+        }
+
+        let id = "\(getpid())-\(UInt64(Date().timeIntervalSince1970 * 1000))"
+        let line = "\(verb)|\(arg)|-|\(mode)|\(id)\n"
+
+        // O_NONBLOCK so a missing daemon is an error instead of a hang; a
+        // single short line is written atomically either way.
+        let fd = open(fifoPath, O_WRONLY | O_NONBLOCK)
+        guard fd >= 0 else {
+            return Reply(ok: false, lines: ["error: cannot reach the netcut helper (is it running?)"])
+        }
+        defer { close(fd) }
+        let written = line.withCString { strlen($0) }
+        guard line.withCString({ write(fd, $0, written) }) == written else {
+            return Reply(ok: false, lines: ["error: could not hand the request to the helper"])
+        }
+
+        let replyPath = "\(runDir)/reply.\(id)"
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let body = try? String(contentsOfFile: replyPath, encoding: .utf8) {
+                let all = body.split(separator: "\n").map(String.init)
+                if all.contains("__done__") {
+                    let lines = all.filter { $0 != "__done__" }
+                    return Reply(ok: !lines.contains { $0.hasPrefix("error:") }, lines: lines)
+                }
+            }
+            usleep(2000)   // 2 ms: a toggle answers in single-digit milliseconds
+        }
+        return Reply(ok: false, lines: ["error: the helper did not answer in \(Int(timeout))s"])
+    }
 }
 
-/// Only one agent at a time. The app can be launched from Spotlight while the
-/// background copy is already running, and two of them would fight over ⌘9 —
-/// the second registration simply fails and the dot would be dead. The second
-/// copy takes the hint and exits.
-nonisolated(unsafe) var lockDescriptor: Int32 = -1
+// MARK: - the countdown overlay
 
-func claimSingleInstance() -> Bool {
-    let dir = "\(home)/.config/netcut"
-    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    let fd = open("\(dir)/agent.lock", O_CREAT | O_RDWR, 0o644)
-    guard fd >= 0 else { return true }          // cannot lock: do not block startup
-    if flock(fd, LOCK_EX | LOCK_NB) != 0 { close(fd); return false }
-    lockDescriptor = fd                          // held for the life of the process
-    return true
+enum Placement: String, CaseIterable {
+    case topLeft, topRight, bottom
+
+    var label: String {
+        switch self {
+        case .topLeft:  return "Top left"
+        case .topRight: return "Top right"
+        case .bottom:   return "Bottom"
+        }
+    }
+
+    static var path: String { "\(home)/.config/netcut/overlay" }
+
+    static func load() -> Placement {
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let p = Placement(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return .topRight }
+        return p
+    }
+
+    func save() {
+        let url = URL(fileURLWithPath: Placement.path)
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? (rawValue + "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+/// A borderless, click-through window showing how long the cut has left.
+/// Joins every Space and sits above full-screen windows, because the app it
+/// is counting down for is usually the one filling the screen.
+@MainActor
+final class CountdownOverlay {
+    private var window: NSWindow?
+    private let label = NSTextField(labelWithString: "")
+    private let dot = NSTextField(labelWithString: "●")
+
+    private func build() -> NSWindow {
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 176, height: 44),
+                         styleMask: .borderless, backing: .buffered, defer: false)
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = true
+        w.level = .screenSaver
+        w.ignoresMouseEvents = true
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+
+        // A HUD material rather than a flat alpha: at 0.82 black the page
+        // behind it still read through the card and the text sat on top of
+        // whatever happened to be there.
+        let card = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 176, height: 44))
+        card.material = .hudWindow
+        card.blendingMode = .behindWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 12
+        card.layer?.masksToBounds = true
+        card.layer?.borderWidth = 1
+        card.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.65).cgColor
+
+        dot.font = .systemFont(ofSize: 13, weight: .bold)
+        dot.textColor = .systemBlue
+        dot.frame = NSRect(x: 14, y: 13, width: 14, height: 18)
+
+        label.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
+        label.textColor = .white
+        label.frame = NSRect(x: 32, y: 12, width: 132, height: 20)
+        label.lineBreakMode = .byTruncatingTail
+
+        card.addSubview(dot)
+        card.addSubview(label)
+        w.contentView = card
+        return w
+    }
+
+    func show(app: String, remaining: Int, placement: Placement) {
+        let w = window ?? build()
+        window = w
+        update(app: app, remaining: remaining)
+        position(w, placement)
+        w.orderFrontRegardless()
+    }
+
+    func update(app: String, remaining: Int) {
+        label.stringValue = "\(app)  ·  \(max(0, remaining))s"
+    }
+
+    func reposition(_ placement: Placement) {
+        guard let w = window, w.isVisible else { return }
+        position(w, placement)
+    }
+
+    private func position(_ w: NSWindow, _ placement: Placement) {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        // visibleFrame keeps it clear of the menu bar and the Dock.
+        let area = screen.visibleFrame
+        let size = w.frame.size
+        let margin: CGFloat = 16
+        let origin: NSPoint
+        switch placement {
+        case .topLeft:
+            origin = NSPoint(x: area.minX + margin, y: area.maxY - size.height - margin)
+        case .topRight:
+            origin = NSPoint(x: area.maxX - size.width - margin, y: area.maxY - size.height - margin)
+        case .bottom:
+            origin = NSPoint(x: area.midX - size.width / 2, y: area.minY + margin)
+        }
+        w.setFrameOrigin(origin)
+    }
+
+    func hide() {
+        window?.orderOut(nil)
+    }
 }
 
 // MARK: - agent
@@ -123,11 +276,10 @@ final class Agent: NSObject, NSMenuDelegate {
     private let statusLine = NSMenuItem(title: "netcut", action: nil, keyEquivalent: "")
     private let cutItem = NSMenuItem(title: "Cut Now", action: nil, keyEquivalent: "")
     private let targetItem = NSMenuItem(title: "Target", action: nil, keyEquivalent: "")
-    private let holdItem = NSMenuItem(title: "Hold", action: nil, keyEquivalent: "")
+    private let placementItem = NSMenuItem(title: "Countdown", action: nil, keyEquivalent: "")
 
     private var indicator: Indicator = .connected
     private var target: Target = .frontmost
-    private var hold = "asap"
     private var lastFrontmost: NSRunningApplication?
     private var cutInFlight = false
     private var lastResult = "no cut yet"
@@ -136,18 +288,16 @@ final class Agent: NSObject, NSMenuDelegate {
     private var hotKeyWorks = false
     private var revertWork: DispatchWorkItem?
     private var signalSources: [DispatchSourceSignal] = []
-    private var watchdog: DispatchWorkItem?
 
     private var cutStarted = Date.distantPast
     private var statusPoll: Timer?
-    private var runningProcess: Process?
-    private var selfTerminated = false
+    private let overlay = CountdownOverlay()
+    private var placement = Placement.load()
+    private var countdown: Timer?
+    private var deadline: Date?
+    private var downAppName = ""
 
     func run() {
-        guard claimSingleInstance() else {
-            logLine("another netcut agent is already running; this copy is exiting")
-            exit(0)
-        }
         NSApplication.shared.setActivationPolicy(.accessory)
         target = loadPinnedTarget()
         buildMenu()
@@ -155,7 +305,7 @@ final class Agent: NSObject, NSMenuDelegate {
         registerHotKey()
         installSignalHandlers()
         render()
-        logLine("started (netcut=\(netcutExecutable() ?? "NOT FOUND"), hotkey=\(hotKeyWorks ? "\(hotKeyLabel) registered" : "FAILED"))")
+        logLine("started (helper protocol=\(NetcutClient.installedProtocol()), hotkey=\(hotKeyWorks ? "\(hotKeyLabel) registered" : "FAILED"), countdown=\(placement.label))")
         NSApplication.shared.run()
     }
 
@@ -167,7 +317,7 @@ final class Agent: NSObject, NSMenuDelegate {
         cutItem.target = self
         cutItem.action = #selector(cutNow)
         targetItem.submenu = NSMenu()
-        holdItem.submenu = NSMenu()
+        placementItem.submenu = NSMenu()
 
         let restore = NSMenuItem(title: "Restore Network Now", action: #selector(restoreNow), keyEquivalent: "")
         restore.target = self
@@ -180,7 +330,7 @@ final class Agent: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(cutItem)
         menu.addItem(targetItem)
-        menu.addItem(holdItem)
+        menu.addItem(placementItem)
         menu.addItem(.separator())
         menu.addItem(restore)
         menu.addItem(openLog)
@@ -199,7 +349,7 @@ final class Agent: NSObject, NSMenuDelegate {
         }
         cutItem.isEnabled = !cutInFlight
         rebuildTargetMenu()
-        rebuildHoldMenu()
+        rebuildPlacementMenu()
     }
 
     private var menuHeadline: String {
@@ -254,17 +404,28 @@ final class Agent: NSObject, NSMenuDelegate {
         }
     }
 
-    private func rebuildHoldMenu() {
-        guard let sub = holdItem.submenu else { return }
+
+
+    private func rebuildPlacementMenu() {
+        guard let sub = placementItem.submenu else { return }
         sub.removeAllItems()
-        holdItem.title = "Hold: \(hold == "asap" ? "until it drops" : "\(hold)s")"
-        for (label, value) in [("Until it drops (fastest)", "asap"), ("3 seconds", "3"), ("10 seconds", "10")] {
-            let item = NSMenuItem(title: label, action: #selector(pickHold(_:)), keyEquivalent: "")
+        placementItem.title = "Countdown: \(placement.label)"
+        for option in Placement.allCases {
+            let item = NSMenuItem(title: option.label, action: #selector(pickPlacement(_:)), keyEquivalent: "")
             item.target = self
-            item.representedObject = value
-            item.state = hold == value ? .on : .off
+            item.representedObject = option.rawValue
+            item.state = option == placement ? .on : .off
             sub.addItem(item)
         }
+    }
+
+    @objc private func pickPlacement(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let option = Placement(rawValue: raw) else { return }
+        placement = option
+        option.save()
+        overlay.reposition(option)
+        render()
     }
 
     private func targetableApps() -> [NSRunningApplication] {
@@ -287,11 +448,7 @@ final class Agent: NSObject, NSMenuDelegate {
         render()
     }
 
-    @objc private func pickHold(_ sender: NSMenuItem) {
-        guard let value = sender.representedObject as? String else { return }
-        hold = value
-        render()
-    }
+
 
     @objc private func openLog() { NSWorkspace.shared.open(URL(fileURLWithPath: logPath)) }
     @objc private func quit() { NSApplication.shared.terminate(nil) }
@@ -363,19 +520,34 @@ final class Agent: NSObject, NSMenuDelegate {
     @objc private func signalFire() { fire(source: "signal") }
 
     @objc private func signalSelfTest() {
-        logLine("indicator self-test: blue for 2s, nothing is being cut")
-        indicator = .down("indicator self-test")
+        logLine("self-test: dot blue and a 6s countdown, nothing is being cut")
+        downAppName = "self-test"
+        indicator = .down("self-test")
         render()
-        revertWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
+        startCountdownDisplayOnly(seconds: 6)
+    }
+
+    /// The countdown without the network half, so the overlay can be checked
+    /// without cutting anything.
+    private func startCountdownDisplayOnly(seconds: Int) {
+        countdown?.invalidate()
+        deadline = Date().addingTimeInterval(TimeInterval(seconds))
+        overlay.show(app: downAppName, remaining: seconds, placement: placement)
+        countdown = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self else { return }
-                if case .down = self.indicator { self.indicator = .connected; self.render() }
+                guard let self, let deadline = self.deadline else { return }
+                let left = deadline.timeIntervalSinceNow
+                if left <= 0 {
+                    self.stopCountdown()
+                    self.indicator = .connected
+                    self.render()
+                } else {
+                    self.overlay.update(app: self.downAppName, remaining: Int(left.rounded(.up)))
+                }
             }
         }
-        revertWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
     }
+
 
     /// While the dot is blue, confirm every few seconds that the block really
     /// is still up. netcutd lifts a forgotten latch on its own cap, and a dot
@@ -414,12 +586,10 @@ final class Agent: NSObject, NSMenuDelegate {
         // reconnect: cancel whatever is running and restore, which is the
         // one direction that can only ever re-open the network.
         if cutInFlight {
-            logLine("\(source): press while busy — cancelling and restoring")
-            selfTerminated = true
-            runningProcess?.terminate()
-            runningProcess = nil
+            // Requests now answer in milliseconds, so this window is tiny —
+            // but the second press must always be allowed to reconnect.
+            logLine("\(source): press while busy — restoring anyway")
             cutInFlight = false
-            watchdog?.cancel()
             startRestore(name: lastTargetName, source: source)
             return
         }
@@ -457,26 +627,9 @@ final class Agent: NSObject, NSMenuDelegate {
         run(arguments: ["--markers", "toggle", bundlePath, "drop"], label: name) { [weak self] code, output in
             MainActor.assumeIsolated { self?.finish(name: name, code: code, output: output) }
         }
-        armWatchdog(name: name)
     }
 
-    /// A blue dot that outlives the cut would be a lie about the network. If
-    /// netcut has not reported the block lifted by the time it must have, the
-    /// child is killed and the indicator says so instead of staying blue.
-    private func armWatchdog(name: String) {
-        let budget: TimeInterval = 6
-        watchdog?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated {
-                guard let self, self.cutInFlight else { return }
-                self.runningProcess?.terminate()
-                self.failed("\(name): netcut did not report back — use Restore Network Now")
-                self.refreshFromDaemon()
-            }
-        }
-        watchdog = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + budget, execute: work)
-    }
+
 
     private func startRestore(name: String, source: String) {
         cutInFlight = true
@@ -485,63 +638,77 @@ final class Agent: NSObject, NSMenuDelegate {
         run(arguments: ["--markers", "restore"], label: name) { [weak self] code, output in
             MainActor.assumeIsolated { self?.finish(name: name, code: code, output: output) }
         }
-        armWatchdog(name: name)
     }
 
-    /// Launches netcut and streams its output. `__restored__` clears the blue
-    /// indicator: the outage is over even though the child is still measuring
-    /// how fast the app reconnects.
+    /// Sends one request to the daemon off the main thread and hands the
+    /// reply back on it. No child process: the keypress path is a write to a
+    /// FIFO and a poll of one file.
     private func run(arguments: [String], label: String,
                      completion: @escaping @Sendable (Int32, String) -> Void) {
-        guard let netcut = netcutExecutable() else {
-            failed("netcut command not found")
-            return
+        let verb: String, arg: String, mode: String
+        switch arguments.first(where: { !$0.hasPrefix("--") }) ?? "status" {
+        case "toggle":
+            verb = "toggle"
+            arg = arguments.count >= 3 ? arguments[2] : "-"
+            mode = arguments.count >= 4 ? arguments[3] : "drop"
+        case "restore": verb = "restore"; arg = "-"; mode = "-"
+        default:        verb = "status";  arg = "-"; mode = "-"
         }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: netcut)
-        process.arguments = arguments
-        process.environment = ["PATH": "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin",
-                               "HOME": home]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-
-        let collected = Collector()
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty { handle.readabilityHandler = nil; return }
-            guard let chunk = String(data: data, encoding: .utf8) else { return }
-            collected.append(chunk)
-            if chunk.contains("__restored__") {
-                DispatchQueue.main.async { MainActor.assumeIsolated { sharedAgent?.networkIs(down: false) } }
-            } else if chunk.contains("__latched__") {
-                DispatchQueue.main.async { MainActor.assumeIsolated { sharedAgent?.networkIs(down: true) } }
+        let started = Date()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let reply = NetcutClient.request(verb, arg: arg, mode: mode,
+                                             timeout: verb == "status" ? 5 : 8)
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
+            DispatchQueue.main.async {
+                logLine("\(verb) \(label) -> \(reply.ok ? "ok" : "FAILED") in \(ms)ms: \(reply.text)")
+                completion(reply.ok ? 0 : 1, reply.lines.joined(separator: "\n"))
             }
-        }
-        process.terminationHandler = { finished in
-            let text = collected.text
-            DispatchQueue.main.async { completion(finished.terminationStatus, text) }
-        }
-        do {
-            try process.run()
-            runningProcess = process
-        } catch {
-            failed("could not start netcut: \(error.localizedDescription)")
         }
     }
 
-    /// The dot changes the instant netcutd says the network changed, with no
-    /// minimum and no animation: blue exactly while the block is up.
-    func networkIs(down: Bool, name: String? = nil) {
+    func networkIs(down: Bool, name: String? = nil, seconds: Int? = nil) {
         revertWork?.cancel()
         if down {
-            if case .down = indicator {} else { indicator = .down(name ?? lastTargetName) }
+            let who = name ?? lastTargetName
+            downAppName = who
+            if case .down = indicator {} else { indicator = .down(who) }
+            startCountdown(seconds: seconds ?? 20)
             startStatusPolling()
         } else {
             indicator = .connected
+            stopCountdown()
             stopStatusPolling()
         }
         render()
+    }
+
+    /// The daemon restores on its own cap; this counts the same window down
+    /// on screen and asks for the restore when it reaches zero, so the dot
+    /// and the overlay clear at the moment the network actually comes back
+    /// rather than a sleep-granularity later.
+    private func startCountdown(seconds: Int) {
+        countdown?.invalidate()
+        deadline = Date().addingTimeInterval(TimeInterval(seconds))
+        overlay.show(app: downAppName, remaining: seconds, placement: placement)
+        countdown = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let deadline = self.deadline else { return }
+                let left = deadline.timeIntervalSinceNow
+                if left <= 0 {
+                    logLine("countdown reached zero — reconnecting \(self.downAppName)")
+                    self.stopCountdown()
+                    self.startRestore(name: self.downAppName, source: "timer")
+                } else {
+                    self.overlay.update(app: self.downAppName, remaining: Int(left.rounded(.up)))
+                }
+            }
+        }
+    }
+
+    private func stopCountdown() {
+        countdown?.invalidate(); countdown = nil
+        deadline = nil
+        overlay.hide()
     }
 
     /// Ask netcutd what is actually true and show that.
@@ -555,14 +722,6 @@ final class Agent: NSObject, NSMenuDelegate {
 
     private func finish(name: String, code: Int32, output: String) {
         cutInFlight = false
-        watchdog?.cancel()
-        runningProcess = nil
-        if selfTerminated {
-            selfTerminated = false
-            logLine("(that was the cancelled request; asking netcutd what is true)")
-            refreshFromDaemon()
-            return
-        }
         let lines = output.split(separator: "\n").map(String.init)
             .filter { !$0.hasPrefix("__") && !$0.isEmpty }
         logLine("netcut exited \(code) in \(Int(Date().timeIntervalSince(cutStarted) * 1000))ms: \(lines.joined(separator: " | "))")
@@ -570,7 +729,12 @@ final class Agent: NSObject, NSMenuDelegate {
             lastResult = lines.last ?? name
             // The markers already moved the dot; this only covers a reply
             // that carried neither of them.
-            if output.contains("__latched__") { networkIs(down: true, name: name) }
+            if output.contains("__latched__") {
+                let cap = output.split(separator: "\n")
+                    .first { $0.hasPrefix("__latched__") }
+                    .flatMap { Int($0.split(separator: " ").dropFirst().first.map(String.init) ?? "") }
+                networkIs(down: true, name: name, seconds: cap ?? 20)
+            }
             else if output.contains("__restored__") { networkIs(down: false) }
             else { refreshFromDaemon() }
         } else {
@@ -631,13 +795,6 @@ final class Agent: NSObject, NSMenuDelegate {
     }
 }
 
-/// Collects child output off the main thread.
-final class Collector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var buffer = ""
-    func append(_ s: String) { lock.lock(); buffer += s; lock.unlock() }
-    var text: String { lock.lock(); defer { lock.unlock() }; return buffer }
-}
 
 nonisolated(unsafe) var sharedAgent: Agent?
 
