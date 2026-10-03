@@ -40,9 +40,14 @@ since() { printf '%s\n' $(( ( $(now) - $1 ) / 1000000 )); }   # -> milliseconds
 restore() {   # idempotent; safe when nothing is cut
   local reason=${1:-manual} token=''
   [ -f "$STATE" ] && token=$(sed -n 's/^token=//p' "$STATE")
-  pfctl -a "$NETCUT_ANCHOR" -F all >/dev/null 2>&1
-  # Rule first, then the pipe: a packet must never meet a pipe that is gone.
+  # Pipe FIRST, then the rule. Flushing the rule first lets fresh packets go
+  # straight out while the pipe still holds seconds of old ones, so the peer
+  # receives a burst of stale positions *after* the current one -- which is
+  # worse than the outage. Deleting the pipe discards its backlog, and the
+  # few milliseconds where the rule points at a dead pipe cost one or two
+  # packets.
   dnctl pipe "$NETCUT_PIPE" delete >/dev/null 2>&1
+  pfctl -a "$NETCUT_ANCHOR" -F all >/dev/null 2>&1
   [ -n "$token" ] && pfctl -X "$token" >/dev/null 2>&1
   rm -f "$STATE"
   say "restore ($reason)"
@@ -326,7 +331,8 @@ do_latch() {
   say "latch $label mode=$mode dir=$direction sockets=$BLOCK_N_BEFORE blocked=${n4}v4/${n6}v6 in=${ms}ms cap=${cap}s"
   printf '__latched__ %s\n' "$cap"
   case "$direction" in
-    out) printf '%s cannot send (%s addresses, %sms) - its traffic still arrives\n' "$label" "$((n4 + n6))" "$ms" ;;
+    out) printf '%s cannot send (%s addresses, %sms) - its traffic still arrives\n' "$label" "$((n4 + n6))" "$ms"
+         awk -v c="$cap" 'BEGIN{ if (c+0 > 5) print "note: past ~4s the peer stops sending because its acks stopped; a shorter window stays inside that budget" }' ;;
     delay) printf '%s is sending %sms late (%s addresses, %sms) - it still sees everything live\n' \
              "$label" "$NETCUT_DELAY_MS" "$((n4 + n6))" "$ms" ;;
     in)  printf '%s cannot receive (%s addresses, %sms) - its own packets still leave\n' "$label" "$((n4 + n6))" "$ms" ;;
